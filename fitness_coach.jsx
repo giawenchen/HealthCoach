@@ -697,9 +697,30 @@ function mergeSeedDays(loaded) {
   return { next, changed };
 }
 
-function hydrateData(raw) {
+// 全新账号的空白数据：无示例历史、无经期、目标从今天起算
+function blankData() {
+  return {
+    version: DATA_VERSION,
+    seedRevision: SEED_REVISION,
+    profile: PROFILE_DEFAULT,
+    periods: [],
+    goal: { targetKg: 4, durationDays: 90, startDate: TODAY },
+    days: {},
+  };
+}
+
+// opts.seed=false 时不灌入内置示例（多用户云端：每个账号独立、干净起步）
+function hydrateData(raw, opts = {}) {
+  const seed = opts.seed !== false;
   const profile = { ...PROFILE_DEFAULT, ...(raw.profile || {}) };
   const days = raw.days || {};
+  if (!seed) {
+    const periods = raw.periods || [];
+    const goal = raw.goal || { targetKg: 4, durationDays: 90, startDate: TODAY };
+    const base = { ...raw, profile, days, periods, goal, version: DATA_VERSION, seedRevision: SEED_REVISION };
+    Object.keys(base.days).forEach((k) => { base.days[k] = recompute(base.days[k]); });
+    return { data: base, changed: (raw.version || 0) < DATA_VERSION };
+  }
   const periods = (raw.periods && raw.periods.length) ? raw.periods : ["2026-06-06"];
   const goal = raw.goal || { targetKg: 4, durationDays: 90, startDate: "2026-06-06" };
   const base = { ...raw, profile, days, periods, goal, version: DATA_VERSION };
@@ -1286,6 +1307,8 @@ export default function App() {
   // 加载
   useEffect(() => {
     (async () => {
+      // 云端多用户模式（已登录走鉴权代理）：每个账号独立、干净起步，不灌示例历史
+      const authMode = typeof window !== "undefined" && window.__AUTH_PROXY === true;
       let r = null, readOk = true;
       try {
         r = await window.storage.get("coach-data");
@@ -1295,18 +1318,18 @@ export default function App() {
       if (r && r.value) {
         try {
           const loaded = JSON.parse(r.value);
-          const { data: hydrated, changed } = hydrateData(loaded);
+          const { data: hydrated } = hydrateData(loaded, { seed: !authMode });
           setData(hydrated);
           try { await window.storage.set("coach-data", JSON.stringify(hydrated)); } catch {}
         } catch (e) {
-          // 解析失败：只在内存里显示示例，不写回，保留原始存档以便排查/恢复
-          const { data: hydrated } = hydrateData(seedData());
+          // 解析失败：只在内存里显示空白/示例，不写回，保留原始存档以便排查/恢复
+          const { data: hydrated } = hydrateData(authMode ? blankData() : seedData(), { seed: !authMode });
           setData(hydrated);
         }
         return;
       }
-      // 仅当确实没有存档、且读取正常时，才落到示例并写入
-      const { data: hydrated } = hydrateData(seedData());
+      // 没有存档：云端模式下空白起步；本地预览仍用示例
+      const { data: hydrated } = hydrateData(authMode ? blankData() : seedData(), { seed: !authMode });
       setData(hydrated);
       if (readOk) {
         try { await window.storage.set("coach-data", JSON.stringify(hydrated)); } catch {}
@@ -1879,7 +1902,8 @@ export default function App() {
           data={data}
           persist={persist}
           reset={async () => {
-            const { data: fresh } = hydrateData(seedData());
+            const authMode = typeof window !== "undefined" && window.__AUTH_PROXY === true;
+            const { data: fresh } = hydrateData(authMode ? blankData() : seedData(), { seed: !authMode });
             await persist(fresh);
             setPicked(TODAY);
             setAsstDate(TODAY);

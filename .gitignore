@@ -4,3 +4,6 @@ node_modules/
 .env.*
 *.log
 .DS_Store
+
+# 个人健康数据备份（仅本地，切勿上传）
+preview-backup.json
