@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#F4F9F6" />
+  <title>食记 · 营养健身管家</title>
+  <style>
+    html, body, #root { margin: 0; min-height: 100%; background: #F4F9F6; }
+    #boot, #login {
+      position: fixed; inset: 0; z-index: 9999;
+      display: flex; align-items: center; justify-content: center; padding: 24px;
+      background: #F4F9F6; color: #6B7A72; font: 14px/1.6 Inter, system-ui, sans-serif;
+    }
+    #login { display: none; }
+    #login.open { display: flex; }
+    .loginBox {
+      background: #fff; border-radius: 22px; padding: 30px 26px; max-width: 380px; width: 100%;
+      box-shadow: 0 12px 40px rgba(28,43,36,.12); text-align: center;
+    }
+    .loginBox h1 { margin: 0 0 4px; font-size: 26px; color: #1C2B24; font-family: "Playfair Display","Noto Serif SC",serif; }
+    .loginBox .sub { margin: 0 0 22px; font-size: 13px; color: #6B7A72; }
+    .loginBox label { display: block; text-align: left; font-size: 12px; color: #6B7A72; margin: 0 0 6px; }
+    .loginBox input {
+      width: 100%; box-sizing: border-box; padding: 13px 15px; border-radius: 13px;
+      border: 1px solid #EDF1EE; font-size: 15px; outline: none;
+    }
+    .loginBox button {
+      width: 100%; padding: 13px; border: none; border-radius: 14px; margin-top: 14px;
+      background: #3DA67D; color: #fff; font-size: 15px; font-weight: 600; cursor: pointer;
+    }
+    .loginBox button:disabled { opacity: .6; cursor: default; }
+    .loginBox .msg { margin-top: 14px; font-size: 13px; color: #2E8B68; line-height: 1.5; }
+    .loginBox .err { color: #C8694E; }
+  </style>
+</head>
+<body>
+  <div id="boot">正在加载食记…</div>
+  <div id="login">
+    <div class="loginBox">
+      <h1>食记</h1>
+      <p class="sub">营养健身管家 · 输入邮箱即可登录</p>
+      <label>邮箱</label>
+      <input id="email" type="email" placeholder="you@example.com" autocomplete="email" />
+      <button id="sendLink" type="button">发送登录链接</button>
+      <div id="loginMsg" class="msg"></div>
+    </div>
+  </div>
+  <div id="root"></div>
+
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script>
+    const bootEl = document.getElementById("boot");
+    const loginEl = document.getElementById("login");
+    const emailEl = document.getElementById("email");
+    const sendBtn = document.getElementById("sendLink");
+    const loginMsg = document.getElementById("loginMsg");
+    let sb = null;
+    let uid = null;
+
+    function showLogin(msg, isErr) {
+      bootEl.style.display = "none";
+      loginEl.classList.add("open");
+      if (msg) { loginMsg.textContent = msg; loginMsg.className = "msg" + (isErr ? " err" : ""); }
+    }
+
+    // 令牌提供给 fitness_coach.jsx 调用受保护的 /api/llm-proxy
+    window.__AUTH_PROXY = true;
+    window.__getToken = async () => {
+      if (!sb) return null;
+      const { data } = await sb.auth.getSession();
+      return (data.session && data.session.access_token) || null;
+    };
+
+    // 云端同步存储：coach-data 存到 Supabase；其余仍用 localStorage
+    window.storage = {
+      async get(key) {
+        if (key !== "coach-data") {
+          const v = localStorage.getItem("hc:" + key);
+          return v != null ? { value: v } : null;
+        }
+        try {
+          const { data, error } = await sb.from("user_state").select("data").eq("user_id", uid).maybeSingle();
+          if (!error && data && data.data && Object.keys(data.data).length) {
+            const s = JSON.stringify(data.data);
+            localStorage.setItem("hc:coach-data", s);
+            return { value: s };
+          }
+        } catch (_) {}
+        // 云端还没有数据：回落到本地缓存（首次登录可把本机已有记录带上去）
+        const v = localStorage.getItem("hc:coach-data");
+        return v != null ? { value: v } : null;
+      },
+      async set(key, val) {
+        if (key !== "coach-data") { localStorage.setItem("hc:" + key, val); return; }
+        localStorage.setItem("hc:coach-data", val);
+        try {
+          await sb.from("user_state").upsert({ user_id: uid, data: JSON.parse(val), updated_at: new Date().toISOString() });
+        } catch (_) {}
+      },
+    };
+
+    async function startApp() {
+      bootEl.style.display = "flex";
+      bootEl.textContent = "正在加载食记…";
+      loginEl.classList.remove("open");
+      // 浏览器内编译 JSX：classic runtime，避免注入 react/jsx-runtime 的 import
+      const res = await fetch("./fitness_coach.jsx?t=" + Date.now(), { cache: "no-store" });
+      if (!res.ok) throw new Error("无法加载应用代码");
+      let code = await res.text();
+      code = code.replace(
+        /^\s*import\s+React\s*,\s*\{[^}]*\}\s*from\s*["']react["'];?\s*/,
+        "const { useState, useEffect, useRef } = React;\n"
+      );
+      code = code.replace(/export\s+default\s+function\s+App/, "function App");
+      code += "\nwindow.__App = App;";
+      if (/^\s*import\s/m.test(code)) code = code.replace(/^\s*import\s.*$/gm, "// $&");
+      const out = Babel.transform(code, { presets: [["react", { runtime: "classic" }]], filename: "fitness_coach.jsx" }).code;
+      eval(out);
+      bootEl.remove();
+      ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(window.__App));
+    }
+
+    sendBtn.onclick = async () => {
+      const email = (emailEl.value || "").trim();
+      if (!email) { loginMsg.textContent = "请输入邮箱"; loginMsg.className = "msg err"; return; }
+      sendBtn.disabled = true; loginMsg.textContent = "发送中…"; loginMsg.className = "msg";
+      try {
+        const { error } = await sb.auth.signInWithOtp({ email, options: { emailRedirectTo: window.location.origin } });
+        if (error) throw error;
+        loginMsg.textContent = "登录链接已发到邮箱，请去邮箱点击链接（可能在垃圾邮件里）。";
+        loginMsg.className = "msg";
+      } catch (e) {
+        loginMsg.textContent = "发送失败：" + (e.message || e);
+        loginMsg.className = "msg err";
+      } finally {
+        sendBtn.disabled = false;
+      }
+    };
+
+    (async function boot() {
+      try {
+        const cfg = await (await fetch("/api/config", { cache: "no-store" })).json();
+        if (!cfg.supabaseUrl || !cfg.supabaseAnonKey) {
+          showLogin("服务端未配置 Supabase（请在 Vercel 设置 SUPABASE_URL / SUPABASE_ANON_KEY）", true);
+          return;
+        }
+        sb = window.supabase.createClient(cfg.supabaseUrl, cfg.supabaseAnonKey, {
+          auth: { detectSessionInUrl: true, persistSession: true, autoRefreshToken: true },
+        });
+        sb.auth.onAuthStateChange((_event, session) => {
+          if (session && session.user && !window.__APP_STARTED) {
+            window.__APP_STARTED = true;
+            uid = session.user.id;
+            startApp().catch((e) => { bootEl.style.display = "flex"; bootEl.textContent = "加载失败：" + e.message; });
+          }
+        });
+        const { data } = await sb.auth.getSession();
+        if (data.session && data.session.user) {
+          window.__APP_STARTED = true;
+          uid = data.session.user.id;
+          await startApp();
+        } else {
+          showLogin();
+        }
+      } catch (e) {
+        showLogin("初始化失败：" + (e.message || e), true);
+      }
+    })();
+  </script>
+</body>
+</html>

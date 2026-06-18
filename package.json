@@ -1,0 +1,7 @@
+{
+  "name": "healthcoach",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "食记 · 营养健身管家（多用户云端版）"
+}

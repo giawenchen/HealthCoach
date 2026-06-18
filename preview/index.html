@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>食记 · Preview</title>
+  <style>
+    html, body, #root { margin: 0; min-height: 100%; }
+    #boot {
+      position: fixed; inset: 0; z-index: 9999;
+      display: flex; align-items: center; justify-content: center;
+      background: #F4F9F6; color: #6B7A72; font: 14px/1.6 Inter, system-ui, sans-serif;
+    }
+    #keyModal {
+      display: none; position: fixed; inset: 0; z-index: 10000;
+      background: rgba(28,43,36,.45); align-items: center; justify-content: center; padding: 20px;
+    }
+    #keyModal.open { display: flex; }
+    #keyBox {
+      background: #fff; border-radius: 20px; padding: 24px; max-width: 420px; width: 100%;
+      box-shadow: 0 12px 40px rgba(28,43,36,.12);
+    }
+    #keyBox h2 { margin: 0 0 8px; font-size: 18px; color: #1C2B24; }
+    #keyBox p { margin: 0 0 14px; font-size: 13px; color: #6B7A72; line-height: 1.55; }
+    #keyBox label { display: block; font-size: 12px; color: #6B7A72; margin: 10px 0 6px; }
+    #keyBox select, #keyBox input {
+      width: 100%; box-sizing: border-box; padding: 12px 14px; border-radius: 12px;
+      border: 1px solid #EDF1EE; font-size: 14px;
+    }
+    #keyBox button {
+      width: 100%; padding: 12px; border: none; border-radius: 14px; margin-top: 14px;
+      background: #3DA67D; color: #fff; font-size: 15px; font-weight: 600; cursor: pointer;
+    }
+    #keyFab {
+      display: none; position: fixed; top: 12px; right: 12px; z-index: 9000;
+      padding: 8px 12px; border-radius: 999px; border: 1px solid #EAF0EC;
+      background: rgba(255,255,255,.92); font-size: 12px; color: #2E8B68; cursor: pointer;
+    }
+  </style>
+</head>
+<body>
+  <div id="boot">正在加载食记…</div>
+  <div id="root"></div>
+  <button id="keyFab" type="button">⚙ AI 设置</button>
+  <div id="keyModal">
+    <div id="keyBox">
+      <h2>配置 AI 管家</h2>
+      <p>本地预览需自备 API Key（仅存浏览器）。<b>DeepSeek 必须用 serve.py 启动</b>，不能只用 python -m http.server。</p>
+      <label>提供商</label>
+      <select id="providerInput">
+        <option value="anthropic">Anthropic Claude（推荐）</option>
+        <option value="deepseek">DeepSeek</option>
+      </select>
+      <label>模型</label>
+      <input id="modelInput" type="text" placeholder="claude-sonnet-4-5-20250929 或 deepseek-chat" autocomplete="off" />
+      <label>API Key</label>
+      <input id="keyInput" type="password" placeholder="sk-ant-... 或 sk-..." autocomplete="off" />
+      <button id="keySave" type="button">保存并继续</button>
+    </div>
+  </div>
+
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script>
+    window.storage = {
+      async get(key) {
+        const v = localStorage.getItem("hc:" + key);
+        return v != null ? { value: v } : null;
+      },
+      async set(key, val) {
+        localStorage.setItem("hc:" + key, val);
+      },
+    };
+
+    const LLM_KEY = "llm-config";
+    const LEGACY_KEY = "anthropic-api-key";
+    const keyModal = document.getElementById("keyModal");
+    const keyInput = document.getElementById("keyInput");
+    const providerInput = document.getElementById("providerInput");
+    const modelInput = document.getElementById("modelInput");
+    const keyFab = document.getElementById("keyFab");
+
+    function loadLLM() {
+      try {
+        const raw = localStorage.getItem("hc:" + LLM_KEY);
+        if (raw) return JSON.parse(raw);
+      } catch (_) {}
+      const legacy = localStorage.getItem(LEGACY_KEY);
+      if (legacy) {
+        const provider = legacy.startsWith("sk-ant-") ? "anthropic" : "deepseek";
+        return {
+          provider,
+          model: provider === "deepseek" ? "deepseek-chat" : "claude-sonnet-4-5-20250929",
+          apiKey: legacy,
+        };
+      }
+      return { provider: "anthropic", model: "claude-sonnet-4-5-20250929", apiKey: "" };
+    }
+
+    function saveLLM(cfg) {
+      localStorage.setItem("hc:" + LLM_KEY, JSON.stringify(cfg));
+      window.__LLM_CONFIG = cfg;
+    }
+
+    function syncModalFromConfig() {
+      const cfg = loadLLM();
+      providerInput.value = cfg.provider || "anthropic";
+      modelInput.value = cfg.model || (cfg.provider === "deepseek" ? "deepseek-chat" : "claude-sonnet-4-5-20250929");
+      keyInput.value = cfg.apiKey || "";
+    }
+
+    function showKeyModal() {
+      syncModalFromConfig();
+      keyModal.classList.add("open");
+    }
+    function hideKeyModal() { keyModal.classList.remove("open"); }
+
+    document.getElementById("keySave").onclick = () => {
+      const apiKey = keyInput.value.trim();
+      if (!apiKey) return;
+      const provider = apiKey.startsWith("sk-ant-") ? "anthropic" : (providerInput.value || "deepseek");
+      const model = modelInput.value.trim() || (provider === "deepseek" ? "deepseek-chat" : "claude-sonnet-4-5-20250929");
+      // 合并已有配置，避免覆盖在 App 设置里填的 Gemini key 等字段
+      saveLLM({ ...loadLLM(), provider, model, apiKey });
+      hideKeyModal();
+      keyFab.style.display = "block";
+    };
+    keyFab.onclick = showKeyModal;
+
+    window.__LLM_CONFIG = loadLLM();
+
+    const origFetch = window.fetch.bind(window);
+    window.fetch = async (url, opts = {}) => {
+      if (String(url).includes("api.anthropic.com")) {
+        const cfg = window.__LLM_CONFIG || loadLLM();
+        if (cfg.provider === "deepseek") {
+          throw new Error("当前选的是 DeepSeek，不应调用 Anthropic 接口。请到设置切换提供商。");
+        }
+        if (!cfg.apiKey) {
+          showKeyModal();
+          throw new Error("请先填入 API Key");
+        }
+        opts.headers = {
+          ...(opts.headers || {}),
+          "Content-Type": "application/json",
+          "x-api-key": cfg.apiKey,
+          "anthropic-version": "2023-06-01",
+          "anthropic-dangerous-direct-browser-access": "true",
+        };
+      }
+      return origFetch(url, opts);
+    };
+
+    async function boot() {
+      const cfg = loadLLM();
+      window.__LLM_CONFIG = cfg;
+      if (!cfg.apiKey) showKeyModal();
+      else {
+        keyFab.style.display = "block";
+        let proxyOk = false;
+        try {
+          const probe = await origFetch("/api/llm-proxy", { method: "OPTIONS" });
+          proxyOk = probe.status === 204 || probe.ok;
+        } catch (_) {}
+        if (!proxyOk) {
+          document.getElementById("boot").innerHTML =
+            "<div style='max-width:420px;line-height:1.7;padding:20px'>" +
+            "<b style='color:#1C2B24'>AI 代理未就绪</b><br><br>" +
+            "Anthropic 和 DeepSeek 在本地预览都必须走代理。<br><br>" +
+            "请运行：<code>python3 preview/serve.py</code><br><br>" +
+            "然后打开 <code>http://127.0.0.1:8765/preview/index.html</code> 并 Cmd+Shift+R 强刷。" +
+            "</div>";
+          return;
+        }
+      }
+
+      const res = await fetch("../fitness_coach.jsx?t=" + Date.now(), { cache: "no-store" });
+      if (!res.ok) throw new Error("无法加载 fitness_coach.jsx");
+      let code = await res.text();
+      // 浏览器预览：React 由 UMD 全局加载，去掉文件首行的 ES module import
+      code = code.replace(
+        /^\s*import\s+React\s*,\s*\{[^}]*\}\s*from\s*["']react["'];?\s*/,
+        "const { useState, useEffect, useRef } = React;\n"
+      );
+      code = code.replace(/export\s+default\s+function\s+App/, "function App");
+      code += "\nwindow.__App = App;";
+      if (/^\s*import\s/m.test(code)) {
+        // 极端兜底：注释掉任何残留的顶层 import 行（CSS 里的 @import 不受影响）
+        code = code.replace(/^\s*import\s.*$/gm, "// $&");
+      }
+
+      const out = Babel.transform(code, {
+        // classic runtime 走 React.createElement，避免自动注入 react/jsx-runtime 的 import
+        presets: [["react", { runtime: "classic" }]],
+        filename: "fitness_coach.jsx",
+      }).code;
+      eval(out);
+
+      document.getElementById("boot").remove();
+      const root = ReactDOM.createRoot(document.getElementById("root"));
+      root.render(React.createElement(window.__App));
+    }
+
+    boot().catch((e) => {
+      document.getElementById("boot").textContent = "加载失败：" + e.message;
+    });
+  </script>
+</body>
+</html>
