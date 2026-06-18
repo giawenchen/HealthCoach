@@ -3185,6 +3185,39 @@ function Settings({ data, persist, reset }) {
   const [g, setG] = useState(data.goal || { targetKg: 4, durationDays: 90, startDate: TODAY });
   const [armed, setArmed] = useState(false);
   const [llm, setLlm] = useState(() => getLLMConfig());
+  const fileRef = useRef(null);
+  const [impMsg, setImpMsg] = useState("");
+  const exportData = () => {
+    try {
+      const blob = new Blob([JSON.stringify(data)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url; a.download = `flexo-backup-${TODAY}.json`;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      setImpMsg("已导出当前数据备份。");
+    } catch (e) { setImpMsg("导出失败：" + (e.message || e)); }
+  };
+  const onPickFile = async (e) => {
+    const file = e.target.files && e.target.files[0];
+    if (e.target) e.target.value = "";
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const raw = JSON.parse(text);
+      if (!raw || typeof raw !== "object" || !raw.days) throw new Error("文件格式不对（缺少 days）");
+      // 只保留合法日期 key，丢掉脏数据（如 "[object Object]"）
+      const days = {};
+      Object.keys(raw.days).forEach((k) => { if (/^\d{4}-\d{2}-\d{2}$/.test(k)) days[k] = raw.days[k]; });
+      const { data: hydrated } = hydrateData({ ...raw, days }, { seed: false });
+      await persist(hydrated);
+      setP(hydrated.profile);
+      setG(hydrated.goal || g);
+      setImpMsg(`✅ 已导入 ${Object.keys(hydrated.days).length} 天记录，并同步到你的账号。`);
+    } catch (err) {
+      setImpMsg("导入失败：" + (err.message || err));
+    }
+  };
   const fields = [
     ["age", "年龄"], ["height", "身高 cm"], ["weight", "体重 kg"],
     ["baseline", "日常消耗(不含运动) kcal"], ["proteinGoal", "蛋白目标 g"], ["fiberGoal", "膳食纤维目标 g"],
@@ -3366,8 +3399,29 @@ function Settings({ data, persist, reset }) {
       <div style={S.card}>
         <div style={S.cardHead}>数据</div>
         <button
+          className="send"
+          style={{ ...S.send, width: "100%" }}
+          onClick={() => fileRef.current && fileRef.current.click()}
+        >
+          导入备份数据（.json）
+        </button>
+        <input
+          ref={fileRef}
+          type="file"
+          accept="application/json,.json"
+          style={{ display: "none" }}
+          onChange={onPickFile}
+        />
+        <button className="link" style={{ ...S.linkBtn, marginTop: 8 }} onClick={exportData}>
+          导出当前数据备份
+        </button>
+        {impMsg && <div style={{ ...S.hint, marginTop: 8 }}>{impMsg}</div>}
+        <div style={{ ...S.hint, marginTop: 6 }}>
+          导入会用备份文件覆盖当前账号的记录，并同步到云端。换设备或重装后可用导出的文件恢复。
+        </div>
+        <button
           className="del"
-          style={{ ...S.resetBtn, background: armed ? C.over : "#fff", color: armed ? "#fff" : C.over }}
+          style={{ ...S.resetBtn, background: armed ? C.over : "#fff", color: armed ? "#fff" : C.over, marginTop: 14 }}
           onClick={() => { if (armed) { reset(); setArmed(false); } else { setArmed(true); } }}
         >
           {armed ? "再点一次确认清空（不可撤销）" : "清空并重置数据"}
@@ -3375,9 +3429,6 @@ function Settings({ data, persist, reset }) {
         {armed && (
           <button className="link" style={{ ...S.linkBtn, marginTop: 8 }} onClick={() => setArmed(false)}>取消</button>
         )}
-        <div style={{ ...S.hint, marginTop: 10 }}>
-          刷新页面会自动同步内置历史补记（6/8–6/14）。如果旧记录显示不正常（比如纤维是 0），点上面重置一次即可。
-        </div>
       </div>
     </div>
   );
