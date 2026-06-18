@@ -3,7 +3,14 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <meta name="theme-color" content="#F4F9F6" />
+  <meta name="theme-color" content="#3DA67D" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+  <meta name="apple-mobile-web-app-title" content="食记" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <link rel="manifest" href="/manifest.webmanifest" />
+  <link rel="icon" href="/icons/icon.svg" type="image/svg+xml" />
+  <link rel="apple-touch-icon" href="/icons/icon.svg" />
   <title>食记 · 营养健身管家</title>
   <style>
     html, body, #root { margin: 0; min-height: 100%; background: #F4F9F6; }
@@ -32,6 +39,12 @@
     .loginBox button:disabled { opacity: .6; cursor: default; }
     .loginBox .msg { margin-top: 14px; font-size: 13px; color: #2E8B68; line-height: 1.5; }
     .loginBox .err { color: #C8694E; }
+    .loginBox .otpRow { margin-top: 14px; }
+    .loginBox .otpRow label { margin-top: 0; }
+    .loginBox .otpInput {
+      text-align: center; font-size: 22px; letter-spacing: 6px; font-weight: 600;
+    }
+    .loginBox .hint { margin-top: 10px; font-size: 12px; color: #9AA8A0; line-height: 1.5; text-align: left; }
   </style>
 </head>
 <body>
@@ -39,24 +52,31 @@
   <div id="login">
     <div class="loginBox">
       <h1>食记</h1>
-      <p class="sub">营养健身管家 · 输入邮箱即可登录</p>
+      <p class="sub">营养健身管家 · 邮箱验证码登录（公司网络也能用）</p>
       <label>邮箱</label>
-      <input id="email" type="email" placeholder="you@example.com" autocomplete="email" />
-      <button id="sendLink" type="button">发送登录链接</button>
+      <input id="email" type="email" placeholder="cjiawen719@gmail.com" autocomplete="email" />
+      <button id="sendLink" type="button">发送验证码</button>
+      <div id="otpRow" class="otpRow" style="display:none">
+        <label>6 位验证码（看邮件正文，不是点链接）</label>
+        <input id="otp" class="otpInput" type="text" inputmode="numeric" maxlength="6" placeholder="000000" autocomplete="one-time-code" />
+        <button id="verifyOtp" type="button">登录</button>
+      </div>
       <div id="loginMsg" class="msg"></div>
+      <p class="hint">公司电脑若拦截邮件链接，请<strong>只看邮件里的数字验证码</strong>填上面。用手机 4G 打开链接也可以。</p>
     </div>
   </div>
   <div id="root"></div>
 
-  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
-  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
-  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script src="/dist/app.js" defer></script>
   <script>
     const bootEl = document.getElementById("boot");
     const loginEl = document.getElementById("login");
     const emailEl = document.getElementById("email");
     const sendBtn = document.getElementById("sendLink");
+    const otpRow = document.getElementById("otpRow");
+    const otpEl = document.getElementById("otp");
+    const verifyBtn = document.getElementById("verifyOtp");
     const loginMsg = document.getElementById("loginMsg");
     let sb = null;
     let uid = null;
@@ -107,21 +127,13 @@
       bootEl.style.display = "flex";
       bootEl.textContent = "正在加载食记…";
       loginEl.classList.remove("open");
-      // 浏览器内编译 JSX：classic runtime，避免注入 react/jsx-runtime 的 import
-      const res = await fetch("./fitness_coach.jsx?t=" + Date.now(), { cache: "no-store" });
-      if (!res.ok) throw new Error("无法加载应用代码");
-      let code = await res.text();
-      code = code.replace(
-        /^\s*import\s+React\s*,\s*\{[^}]*\}\s*from\s*["']react["'];?\s*/,
-        "const { useState, useEffect, useRef } = React;\n"
-      );
-      code = code.replace(/export\s+default\s+function\s+App/, "function App");
-      code += "\nwindow.__App = App;";
-      if (/^\s*import\s/m.test(code)) code = code.replace(/^\s*import\s.*$/gm, "// $&");
-      const out = Babel.transform(code, { presets: [["react", { runtime: "classic" }]], filename: "fitness_coach.jsx" }).code;
-      eval(out);
+      // 等待预编译 bundle（构建时 esbuild 打包，手机不再现场编译 JSX）
+      for (let i = 0; i < 80 && !window.__mountApp; i++) {
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      if (!window.__App || !window.__mountApp) throw new Error("应用脚本未加载，请刷新或清除缓存后重试");
       bootEl.remove();
-      ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(window.__App));
+      window.__mountApp(document.getElementById("root"));
     }
 
     sendBtn.onclick = async () => {
@@ -129,15 +141,39 @@
       if (!email) { loginMsg.textContent = "请输入邮箱"; loginMsg.className = "msg err"; return; }
       sendBtn.disabled = true; loginMsg.textContent = "发送中…"; loginMsg.className = "msg";
       try {
-        const { error } = await sb.auth.signInWithOtp({ email, options: { emailRedirectTo: window.location.origin } });
+        const { error } = await sb.auth.signInWithOtp({
+          email,
+          options: { emailRedirectTo: window.location.origin, shouldCreateUser: true },
+        });
         if (error) throw error;
-        loginMsg.textContent = "登录链接已发到邮箱，请去邮箱点击链接（可能在垃圾邮件里）。";
+        otpRow.style.display = "block";
+        otpEl.focus();
+        loginMsg.textContent = "验证码已发到邮箱。请打开邮件找 6 位数字（不要点链接，公司网络会拦）。";
         loginMsg.className = "msg";
       } catch (e) {
         loginMsg.textContent = "发送失败：" + (e.message || e);
         loginMsg.className = "msg err";
       } finally {
         sendBtn.disabled = false;
+      }
+    };
+
+    verifyBtn.onclick = async () => {
+      const email = (emailEl.value || "").trim();
+      const token = (otpEl.value || "").trim().replace(/\s/g, "");
+      if (!email) { loginMsg.textContent = "请输入邮箱"; loginMsg.className = "msg err"; return; }
+      if (!/^\d{6}$/.test(token)) { loginMsg.textContent = "请输入邮件里的 6 位数字验证码"; loginMsg.className = "msg err"; return; }
+      verifyBtn.disabled = true; loginMsg.textContent = "验证中…"; loginMsg.className = "msg";
+      try {
+        const { error } = await sb.auth.verifyOtp({ email, token, type: "email" });
+        if (error) throw error;
+        loginMsg.textContent = "登录成功，正在进入…";
+        loginMsg.className = "msg";
+      } catch (e) {
+        loginMsg.textContent = "验证失败：" + (e.message || e) + "（验证码 10 分钟内有效，可重新发送）";
+        loginMsg.className = "msg err";
+      } finally {
+        verifyBtn.disabled = false;
       }
     };
 
@@ -170,6 +206,12 @@
         showLogin("初始化失败：" + (e.message || e), true);
       }
     })();
+
+    if ("serviceWorker" in navigator) {
+      window.addEventListener("load", () => {
+        navigator.serviceWorker.register("/sw.js").catch(() => {});
+      });
+    }
   </script>
 </body>
 </html>

@@ -1399,7 +1399,7 @@ export default function App() {
         ? `\n【血糖模式】每个 food 给 gi（0-100）。time（"HH:MM"）只在用户明确说了时间或时段时才给（如"中午""下午三点""19点"）；用户说"现在/刚/刚刚"或没提时间，就【不要写 time】（留空，由 App 用当前真实时间，不要按食物类型猜早午晚）。每个 exercise 给 kind（strength/cardio/sport/other）与 intensity，time 同理。edit 改时间时 patch 里给 time:"HH:MM"。`
         : "");
 
-    const raw = await callLLM(`${sys}\n\n用户最新消息：${text}`, 3000);
+    const raw = await callLLM(`${sys}\n\n用户最新消息：${text}`, 2000);
     let parsed;
     try {
       parsed = parseAIJson(raw);

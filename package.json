@@ -3,5 +3,16 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "vercel-build": "npm run build"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0"
+  },
   "description": "食记 · 营养健身管家（多用户云端版）"
 }

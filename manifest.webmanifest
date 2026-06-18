@@ -1,0 +1,25 @@
+{
+  "name": "食记 · 营养健身管家",
+  "short_name": "食记",
+  "description": "AI 营养健身记录与管家",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#F4F9F6",
+  "theme_color": "#3DA67D",
+  "icons": [
+    {
+      "src": "/icons/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    },
+    {
+      "src": "/icons/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "maskable"
+    }
+  ]
+}
