@@ -1,12 +1,12 @@
 import * as esbuild from "esbuild";
 import { mkdirSync, statSync } from "fs";
 
-mkdirSync("dist", { recursive: true });
+mkdirSync("public/dist", { recursive: true });
 
 await esbuild.build({
   entryPoints: ["src/entry.jsx"],
   bundle: true,
-  outfile: "dist/app.js",
+  outfile: "public/dist/app.js",
   format: "iife",
   platform: "browser",
   target: ["es2020", "safari14"],
@@ -17,5 +17,5 @@ await esbuild.build({
   define: { "process.env.NODE_ENV": '"production"' },
 });
 
-const kb = statSync("dist/app.js").size / 1024;
-console.log(`✓ dist/app.js (${kb.toFixed(1)} KB minified)`);
+const kb = statSync("public/dist/app.js").size / 1024;
+console.log(`✓ public/dist/app.js (${kb.toFixed(1)} KB minified)`);
