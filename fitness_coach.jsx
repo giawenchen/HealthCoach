@@ -319,6 +319,24 @@ const iso = (d) =>
   ).padStart(2, "0")}`;
 const TODAY = iso(new Date());
 
+function isValidDayKey(key) {
+  if (!key || typeof key !== "string") return false;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(key)) return false;
+  const d = new Date(key + "T12:00:00");
+  return !isNaN(d.getTime()) && iso(d) === key;
+}
+
+function normalizeDayKey(key, fallback = TODAY) {
+  return isValidDayKey(key) ? key : fallback;
+}
+
+function dayLabelFromKey(key) {
+  const k = normalizeDayKey(key);
+  if (k === TODAY) return "今天";
+  const d = new Date(k + "T12:00:00");
+  return `${d.getMonth() + 1}月${d.getDate()}日 周${WEEK[mondayIndex(d.getDay())]}`;
+}
+
 // 把周日=0 转成周一=0
 const mondayIndex = (jsDay) => (jsDay + 6) % 7;
 
@@ -327,13 +345,13 @@ function inferBackfillDay(text, fallback) {
   if (!text) return fallback;
   const backfill = /补记|补录|补填|回填/.test(text);
   const isoM = text.match(/(\d{4}-\d{2}-\d{2})/);
-  if (isoM && (backfill || isoM[1] !== TODAY)) return isoM[1];
+  if (isoM && (backfill || isoM[1] !== TODAY)) return normalizeDayKey(isoM[1], fallback);
   const cnM = text.match(/(\d{1,2})\s*月\s*(\d{1,2})\s*日/);
   if (cnM && backfill) {
     const y = new Date().getFullYear();
-    return `${y}-${String(+cnM[1]).padStart(2, "0")}-${String(+cnM[2]).padStart(2, "0")}`;
+    return normalizeDayKey(`${y}-${String(+cnM[1]).padStart(2, "0")}-${String(+cnM[2]).padStart(2, "0")}`, fallback);
   }
-  return fallback;
+  return normalizeDayKey(fallback);
 }
 
 // 从 AI 原始回复里抠 JSON（容忍 markdown 代码块）
@@ -1295,7 +1313,8 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [asstOpen, setAsstOpen] = useState(false); // 管家浮窗开关
   const [asstFull, setAsstFull] = useState(false);  // 是否放大为整页
-  const [asstDate, setAsstDate] = useState(TODAY);  // 管家当前对话/记录的日期
+  const [asstDate, setAsstDateRaw] = useState(TODAY);  // 管家当前对话/记录的日期
+  const setAsstDate = (key) => setAsstDateRaw(normalizeDayKey(key));
   const [calMonth, setCalMonth] = useState(() => {
     const d = new Date(); return { y: d.getFullYear(), m: d.getMonth() };
   });
@@ -1337,7 +1356,7 @@ export default function App() {
     })();
   }, []);
 
-  const asstChat = (data && data.days[asstDate] && data.days[asstDate].chat) || [];
+  const asstChat = (data && data.days[normalizeDayKey(asstDate)] && data.days[normalizeDayKey(asstDate)].chat) || [];
   useEffect(() => {
     if (chatRef.current) chatRef.current.scrollTop = chatRef.current.scrollHeight;
   }, [asstChat.length, loading, asstOpen, asstFull, asstDate]);
@@ -1478,7 +1497,7 @@ export default function App() {
     const displayText = input.trim();
     const images = pendingImages;
     if ((!displayText && !images.length) || loading) return;
-    const dayKey = forDayKey || inferBackfillDay(displayText, asstDate);
+    const dayKey = normalizeDayKey(forDayKey || inferBackfillDay(displayText, asstDate));
     if (dayKey !== asstDate) setAsstDate(dayKey);
     const history = ((data.days[dayKey] && data.days[dayKey].chat) || []).slice(-6);
     setInput("");
@@ -1731,12 +1750,14 @@ export default function App() {
 
   const today = data.days[TODAY];
   const todayDef = deficitOf(today, data.profile.baseline);
-  const dayLabel = (key) => {
-    if (key === TODAY) return "今天";
-    const d = new Date(key + "T00:00:00");
-    return `${d.getMonth() + 1}月${d.getDate()}日 周${WEEK[mondayIndex(d.getDay())]}`;
+  const dayLabel = dayLabelFromKey;
+  const safeAsstDate = normalizeDayKey(asstDate);
+  const openAsst = (date) => {
+    if (date) setAsstDate(date);
+    else if (!isValidDayKey(asstDate)) setAsstDate(TODAY);
+    setAsstFull(true);
+    setAsstOpen(true);
   };
-  const openAsst = (date) => { if (date) setAsstDate(date); setAsstFull(true); setAsstOpen(true); };
   const dailyTarget = data.goal && data.goal.durationDays
     ? Math.round((data.goal.targetKg * KCAL_PER_KG) / data.goal.durationDays)
     : 300;
@@ -1931,10 +1952,14 @@ export default function App() {
                     className="field"
                     style={S.asstDateInput}
                     max={TODAY}
-                    value={asstDate}
-                    onChange={(e) => setAsstDate(e.target.value)}
+                    value={safeAsstDate}
+                    onChange={(e) => {
+                      const v = e.target.value;
+                      if (v) setAsstDate(v);
+                      else setAsstDate(TODAY);
+                    }}
                   />
-                  {asstDate !== TODAY && (
+                  {safeAsstDate !== TODAY && (
                     <button className="link" style={S.asstToday} onClick={() => setAsstDate(TODAY)}>回今天</button>
                   )}
                 </div>
@@ -1948,7 +1973,7 @@ export default function App() {
             <div ref={chatRef} style={asstFull ? S.asstBodyFull : S.asstBody}>
               {asstChat.length === 0 && (
                 <div style={S.hint}>
-                  {asstDate !== TODAY && (<><b style={{ color: C.accentDark }}>正在聊 {dayLabel(asstDate)}</b><br /></>)}
+                  {safeAsstDate !== TODAY && (<><b style={{ color: C.accentDark }}>正在聊 {dayLabel(safeAsstDate)}</b><br /></>)}
                   我是你的营养健身管家，随时跟我说：<br />
                   「午饭吃了1.5拳牛腩、海带沙拉、5口米饭」<br />
                   「跑步机爬坡30分钟＋楼梯机12分钟」<br />
@@ -1983,7 +2008,7 @@ export default function App() {
                 className="field"
                 style={S.input}
                 value={input}
-                placeholder={asstDate === TODAY ? "和管家说点什么…" : `聊/补记 ${dayLabel(asstDate)}…`}
+                placeholder={safeAsstDate === TODAY ? "和管家说点什么…" : `聊/补记 ${dayLabel(safeAsstDate)}…`}
                 onChange={(e) => setInput(e.target.value)}
                 onKeyDown={(e) => { if (e.key === "Enter" && !e.nativeEvent.isComposing && e.keyCode !== 229) handleSend(); }}
               />
