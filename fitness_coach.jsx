@@ -385,6 +385,70 @@ function inferBackfillDay(text, fallback = TODAY) {
   return normalizeDayKey(fallback);
 }
 
+function looksLikeClear(text) {
+  if (!text) return false;
+  if (/别删|不要删|别清空/.test(text)) return false;
+  return /删(掉|除|了)|清空|清零|记错了|不要了|撤销|都删|全删|取消记录|移除|清除/.test(text);
+}
+
+// 推断要清空哪些天（支持「都删掉」「周五周六」、结合最近对话）
+function inferClearDates(text, data, chat) {
+  const dates = new Set();
+  const weekRe = /(?:周|星期|礼拜)([一二三四五六日天])/g;
+  let m;
+  while ((m = weekRe.exec(text)) !== null) dates.add(weekdayCharToDate(m[1], TODAY));
+
+  (text.match(/\d{4}-\d{2}-\d{2}/g) || []).forEach((d) => dates.add(normalizeDayKey(d)));
+
+  const cnRe = /(\d{1,2})\s*月\s*(\d{1,2})\s*日/g;
+  let cm;
+  while ((cm = cnRe.exec(text)) !== null) {
+    const y = new Date().getFullYear();
+    dates.add(normalizeDayKey(`${y}-${String(+cm[1]).padStart(2, "0")}-${String(+cm[2]).padStart(2, "0")}`));
+  }
+
+  if (/都|这些|刚才|最近|全|全部|错了|记错/.test(text)) {
+    (chat || []).slice(-30).forEach((msg) => {
+      if (msg.logDay && isValidDayKey(msg.logDay)) dates.add(msg.logDay);
+    });
+    const cutoff = new Date(TODAY + "T12:00:00");
+    cutoff.setDate(cutoff.getDate() - 14);
+    Object.keys(data.days || {}).forEach((k) => {
+      if (!isValidDayKey(k)) return;
+      const d = new Date(k + "T12:00:00");
+      if (d >= cutoff && (data.days[k].entries?.length > 0)) dates.add(k);
+    });
+  }
+
+  if (dates.size === 0) dates.add(normalizeDayKey(inferBackfillDay(text, TODAY)));
+  return [...dates].filter(isValidDayKey);
+}
+
+function clearDaysInData(data, dates) {
+  const dnext = { ...data, days: { ...data.days } };
+  dates.forEach((k) => {
+    dnext.days[k] = recompute({ ...(dnext.days[k] || {}), entries: [] });
+  });
+  return dnext;
+}
+
+// 去掉被 AI 清零的残留条目（kcal/burn 为 0 的项直接移除）
+function scrubEmptyEntries(day) {
+  if (!day) return recompute({ entries: [] });
+  const entries = (day.entries || []).map((e) => ({
+    ...e,
+    foods: (e.foods || []).filter((f) => num(f.kcal) > 0 || num(f.protein) > 0 || num(f.carbs) > 0),
+    exercises: (e.exercises || []).filter((x) => num(x.burn) > 0),
+  })).filter((e) => (e.foods?.length || 0) + (e.exercises?.length || 0) > 0);
+  return recompute({ ...day, entries });
+}
+
+function scrubAllDays(data) {
+  const days = { ...data.days };
+  Object.keys(days).forEach((k) => { days[k] = scrubEmptyEntries(days[k]); });
+  return { ...data, days };
+}
+
 // 合并各天旧 chat 到全局管家对话
 function migrateAssistantChat(data) {
   if (Array.isArray(data.assistantChat)) return data;
@@ -780,7 +844,9 @@ function hydrateData(raw, opts = {}) {
     const base = { ...raw, profile, days, periods, goal, version: DATA_VERSION, seedRevision: SEED_REVISION, assistantChat: raw.assistantChat || [] };
     Object.keys(base.days).forEach((k) => { base.days[k] = recompute(base.days[k]); });
     const migrated = migrateAssistantChat(base);
-    return { data: migrated, changed: (raw.version || 0) < DATA_VERSION || migrated.assistantChat !== base.assistantChat };
+    const scrubbed = scrubAllDays(migrated);
+    const scrubChanged = JSON.stringify(scrubbed.days) !== JSON.stringify(migrated.days);
+    return { data: scrubbed, changed: (raw.version || 0) < DATA_VERSION || migrated.assistantChat !== base.assistantChat || scrubChanged };
   }
   const periods = (raw.periods && raw.periods.length) ? raw.periods : ["2026-06-06"];
   const goal = raw.goal || { targetKg: 4, durationDays: 90, startDate: "2026-06-06" };
@@ -788,7 +854,9 @@ function hydrateData(raw, opts = {}) {
   const { next, changed } = mergeSeedDays(base);
   Object.keys(next.days).forEach((k) => { next.days[k] = recompute(next.days[k]); });
   const migrated = migrateAssistantChat({ ...next, version: DATA_VERSION, assistantChat: next.assistantChat || [] });
-  return { data: migrated, changed: changed || (raw.version || 0) < DATA_VERSION || migrated.assistantChat !== next.assistantChat };
+  const scrubbed = scrubAllDays(migrated);
+  const scrubChanged = JSON.stringify(scrubbed.days) !== JSON.stringify(migrated.days);
+  return { data: scrubbed, changed: changed || (raw.version || 0) < DATA_VERSION || migrated.assistantChat !== next.assistantChat || scrubChanged };
 }
 
 // 去掉 AI 回复里的 markdown 记号，聊天里只显示纯文本
@@ -1452,7 +1520,7 @@ export default function App() {
       `1) 记录新的食物或运动 → {"action":"add","targetDate":"YYYY-MM-DD","foods":[...],"exercises":[...],"reply":"简短反馈"}\n` +
       `2) 纠正已有条目 → {"action":"edit","targetDate":"YYYY-MM-DD","edits":[{"id":编号,"patch":{...}}],"reply":"..."}\n` +
       `3) 提问/讨论 → {"action":"discuss","reply":"详细解答"}\n` +
-      `4) 删除/清空记录（用户说记错了、删掉、清空某天）→ {"action":"clear","clearDates":["YYYY-MM-DD",...],"reply":"说明删了哪些天"}\n\n` +
+      `4) 删除/清空记录（用户说记错了、删掉、清空某天）→ {"action":"clear","clearDates":["YYYY-MM-DD",...],"reply":"说明删了哪些天"}。clear 会【整批移除条目】，绝不要把 kcal 改成 0 来假装删除。\n\n` +
       `判断要点：用户在【陈述自己刚吃了/做了什么/练了什么】→ 必须 add，并填好 foods 和/或 exercises；一句话里同时有运动+饮食时，两个数组都要填，不能留空。用户句子里已写明的 kcal（如 300kcal、60kcal）必须原样采用。` +
       `只有带问号、在征求建议、在延续上文纯讨论时，才用 discuss。` +
       `绝不能 action:add 但 foods 和 exercises 都为空；绝不能只 reply「好的」却不给条目。` +
@@ -1571,6 +1639,21 @@ export default function App() {
     if (visionDesc) meMsg.vision = visionDesc;
     const afterUser = withChat(data, meMsg);
     await persist(afterUser);
+
+    // 用户要求删除：本地直接删条目，不让 AI 只把数字清零
+    if (looksLikeClear(displayText)) {
+      const dates = inferClearDates(displayText, afterUser, afterUser.assistantChat || []);
+      let dnext = clearDaysInData(afterUser, dates);
+      const label = dates.map((d) => dayLabelFromKey(d)).join("、");
+      await persist(withChat(dnext, {
+        who: "ai", kind: "log",
+        text: `已删除 ${label} 的全部饮食与运动记录（条目已移除）。`,
+        logDay: dates[0],
+      }));
+      if (dates[0]) setPicked(dates[0]);
+      setLoading(false);
+      return;
+    }
     const numFields = (patch, keys) => {
       const o = {};
       keys.forEach((k) => { if (patch[k] != null && !isNaN(+patch[k])) o[k] = +patch[k]; });
@@ -1654,14 +1737,13 @@ export default function App() {
       }
 
       if (action === "clear") {
-        const rawDates = parsed.clearDates || parsed.clearDays || [recordDay];
-        const dates = rawDates.map((d) => normalizeDayKey(d)).filter(isValidDayKey);
-        let dnext = { ...afterUser, days: { ...afterUser.days } };
-        dates.forEach((k) => {
-          if (dnext.days[k]) dnext.days[k] = recompute({ ...dnext.days[k], entries: [] });
-        });
-        await persist(withChat(dnext, { who: "ai", kind: "log", text: reply, logDay: dates[0] }));
-        if (dates[0]) setPicked(dates[0]);
+        const dates = inferClearDates(displayText, afterUser, afterUser.assistantChat || []);
+        const fromAi = (parsed.clearDates || parsed.clearDays || []).map((d) => normalizeDayKey(d)).filter(isValidDayKey);
+        const merged = [...new Set([...dates, ...fromAi])];
+        let dnext = clearDaysInData(afterUser, merged);
+        const label = merged.map((d) => dayLabelFromKey(d)).join("、");
+        await persist(withChat(dnext, { who: "ai", kind: "log", text: reply || `已删除 ${label} 的全部饮食与运动记录。`, logDay: merged[0] }));
+        if (merged[0]) setPicked(merged[0]);
       } else if (action === "discuss") {
         await persist(withChat(afterUser, { who: "ai", kind: "chat", text: reply }));
       } else if (action === "edit" && edits.length) {
@@ -1681,7 +1763,7 @@ export default function App() {
             ? { ...cur, ...numFields(ed.patch, ["kcal", "protein", "carbs", "fat", "fiber", "gi"]), ...(ed.patch.name ? { name: ed.patch.name } : {}), ...(ed.patch.nutrients != null ? { nutrients: ed.patch.nutrients } : {}), ...(ed.patch.time ? { time: ed.patch.time } : {}) }
             : { ...cur, ...numFields(ed.patch, ["burn"]), ...(ed.patch.name ? { name: ed.patch.name } : {}), ...(ed.patch.kind ? { kind: ed.patch.kind } : {}), ...(ed.patch.time ? { time: ed.patch.time } : {}) };
         });
-        dnext.days[dk] = recompute({ ...prev, entries });
+        dnext.days[dk] = scrubEmptyEntries({ ...prev, entries });
         const def = deficitOf(dnext.days[dk], dnext.profile.baseline);
         await persist(withChat(dnext, { who: "ai", kind: "log", text: reply, note: `${dateTagFor(dk)}缺口 ${def} kcal`, logDay: dk }));
         setPicked(dk);
