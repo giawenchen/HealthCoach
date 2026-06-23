@@ -46,7 +46,7 @@ const PROFILE_DEFAULT = {
 };
 
 const SEED_DAY = "2026-06-08";
-const DATA_VERSION = 6; // 数据结构版本，升级后自动迁移旧数据
+const DATA_VERSION = 7; // v7: 全局管家对话 assistantChat + 按消息识别日期
 const SEED_REVISION = 2; // 内置历史记录版本；升级后会把 seed 里的补记天数写回本地存档
 const KCAL_PER_KG = 7700; // 1kg 脂肪 ≈ 7700 kcal
 const WEEK = ["一", "二", "三", "四", "五", "六", "日"];
@@ -340,18 +340,59 @@ function dayLabelFromKey(key) {
 // 把周日=0 转成周一=0
 const mondayIndex = (jsDay) => (jsDay + 6) % 7;
 
-// 从「补记 2026-06-10」这类话里识别目标日期
-function inferBackfillDay(text, fallback) {
-  if (!text) return fallback;
+const CN_WEEKDAY_CHAR = { 一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 日: 0, 天: 0 };
+
+function weekdayCharToDate(cnChar, refIso = TODAY) {
+  const n = CN_WEEKDAY_CHAR[cnChar];
+  if (n === undefined) return refIso;
+  const ref = new Date(refIso + "T12:00:00");
+  let diff = n - ref.getDay();
+  ref.setDate(ref.getDate() + diff);
+  return iso(ref);
+}
+
+// 从用户话里识别要记到哪一天（默认今天，不沿用上次选的日期）
+function inferBackfillDay(text, fallback = TODAY) {
+  if (!text) return normalizeDayKey(fallback);
   const backfill = /补记|补录|补填|回填/.test(text);
   const isoM = text.match(/(\d{4}-\d{2}-\d{2})/);
   if (isoM && (backfill || isoM[1] !== TODAY)) return normalizeDayKey(isoM[1], fallback);
+
+  const cnDate = text.match(/(?:^|[\n，。])(\d{1,2})\s*月\s*(\d{1,2})\s*日/);
+  if (cnDate) {
+    const y = new Date().getFullYear();
+    return normalizeDayKey(`${y}-${String(+cnDate[1]).padStart(2, "0")}-${String(+cnDate[2]).padStart(2, "0")}`, fallback);
+  }
+  if (/(?:^|[\n，。])昨天/.test(text)) {
+    const d = new Date(TODAY + "T12:00:00"); d.setDate(d.getDate() - 1); return iso(d);
+  }
+  if (/(?:^|[\n，。])前天/.test(text)) {
+    const d = new Date(TODAY + "T12:00:00"); d.setDate(d.getDate() - 2); return iso(d);
+  }
+  const weekRe = /(?:^|[\n，。；])(?:周|星期|礼拜)([一二三四五六日天])/g;
+  let wm;
+  while ((wm = weekRe.exec(text)) !== null) {
+    return weekdayCharToDate(wm[1], TODAY);
+  }
+  const startM = text.match(/^(?:周|星期|礼拜)([一二三四五六日天])/);
+  if (startM) return weekdayCharToDate(startM[1], TODAY);
+
   const cnM = text.match(/(\d{1,2})\s*月\s*(\d{1,2})\s*日/);
   if (cnM && backfill) {
     const y = new Date().getFullYear();
     return normalizeDayKey(`${y}-${String(+cnM[1]).padStart(2, "0")}-${String(+cnM[2]).padStart(2, "0")}`, fallback);
   }
   return normalizeDayKey(fallback);
+}
+
+// 合并各天旧 chat 到全局管家对话
+function migrateAssistantChat(data) {
+  if (Array.isArray(data.assistantChat)) return data;
+  const merged = [];
+  Object.keys(data.days || {}).sort().forEach((key) => {
+    (data.days[key].chat || []).forEach((m) => merged.push({ ...m, logDay: m.logDay || key }));
+  });
+  return { ...data, assistantChat: merged };
 }
 
 // 从 AI 原始回复里抠 JSON（容忍 markdown 代码块）
@@ -724,6 +765,7 @@ function blankData() {
     periods: [],
     goal: { targetKg: 4, durationDays: 90, startDate: TODAY },
     days: {},
+    assistantChat: [],
   };
 }
 
@@ -735,16 +777,18 @@ function hydrateData(raw, opts = {}) {
   if (!seed) {
     const periods = raw.periods || [];
     const goal = raw.goal || { targetKg: 4, durationDays: 90, startDate: TODAY };
-    const base = { ...raw, profile, days, periods, goal, version: DATA_VERSION, seedRevision: SEED_REVISION };
+    const base = { ...raw, profile, days, periods, goal, version: DATA_VERSION, seedRevision: SEED_REVISION, assistantChat: raw.assistantChat || [] };
     Object.keys(base.days).forEach((k) => { base.days[k] = recompute(base.days[k]); });
-    return { data: base, changed: (raw.version || 0) < DATA_VERSION };
+    const migrated = migrateAssistantChat(base);
+    return { data: migrated, changed: (raw.version || 0) < DATA_VERSION || migrated.assistantChat !== base.assistantChat };
   }
   const periods = (raw.periods && raw.periods.length) ? raw.periods : ["2026-06-06"];
   const goal = raw.goal || { targetKg: 4, durationDays: 90, startDate: "2026-06-06" };
   const base = { ...raw, profile, days, periods, goal, version: DATA_VERSION };
   const { next, changed } = mergeSeedDays(base);
   Object.keys(next.days).forEach((k) => { next.days[k] = recompute(next.days[k]); });
-  return { data: next, changed: changed || (raw.version || 0) < DATA_VERSION };
+  const migrated = migrateAssistantChat({ ...next, version: DATA_VERSION, assistantChat: next.assistantChat || [] });
+  return { data: migrated, changed: changed || (raw.version || 0) < DATA_VERSION || migrated.assistantChat !== next.assistantChat };
 }
 
 // 去掉 AI 回复里的 markdown 记号，聊天里只显示纯文本
@@ -1313,8 +1357,6 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [asstOpen, setAsstOpen] = useState(false); // 管家浮窗开关
   const [asstFull, setAsstFull] = useState(false);  // 是否放大为整页
-  const [asstDate, setAsstDateRaw] = useState(TODAY);  // 管家当前对话/记录的日期
-  const setAsstDate = (key) => setAsstDateRaw(normalizeDayKey(key));
   const [calMonth, setCalMonth] = useState(() => {
     const d = new Date(); return { y: d.getFullYear(), m: d.getMonth() };
   });
@@ -1356,10 +1398,11 @@ export default function App() {
     })();
   }, []);
 
-  const asstChat = (data && data.days[normalizeDayKey(asstDate)] && data.days[normalizeDayKey(asstDate)].chat) || [];
+  const assistantChat = (data && data.assistantChat) || [];
+  const asstChat = assistantChat;
   useEffect(() => {
     if (chatRef.current) chatRef.current.scrollTop = chatRef.current.scrollHeight;
-  }, [asstChat.length, loading, asstOpen, asstFull, asstDate]);
+  }, [asstChat.length, loading, asstOpen, asstFull]);
 
   async function persist(next) {
     setData(next);
@@ -1402,11 +1445,14 @@ export default function App() {
       : "";
     const sys =
       `你是饮食/健身记录助手。用户：${p.age}岁${p.sex}，${p.height}cm，${p.weight}kg。\n` +
-      `当天已记录的条目（JSON，含编号 id）：\n${JSON.stringify(itemsForAI)}\n` + convo + `\n` +
+      `今天是 ${TODAY}（${dayLabelFromKey(TODAY)}）。用户和你是【同一个连续对话】；饮食记录按天分开存，但聊天不分天。\n` +
+      `本条消息要记到哪一天（targetDate，YYYY-MM-DD）：看用户是否写了周几/昨天/几月几日；写了「周六早上」必须记到对应周六，不能和周五混在同一天；没写日期则默认今天 ${TODAY}。\n` +
+      `当天（targetDate 那天）已记录的条目（JSON，含编号 id）：\n${JSON.stringify(itemsForAI)}\n` + convo + `\n` +
       `判断用户【最新这句话】的意图，只返回一个 JSON（不要多余文字、不要 markdown）：\n` +
-      `1) 记录新的食物或运动 → {"action":"add","foods":[{"name","kcal","protein","carbs","fat","fiber","nutrients"}],"exercises":[{"name","burn"}],"reply":"简短反馈"}\n` +
-      `2) 纠正/澄清/重算某个已有条目（如"有氧其实300""重新算一下""那个米饭多了""是熟重不是干重""没放糖""其实只有半碗""少放了油""那个忘了说有勾芡"）→ {"action":"edit","edits":[{"id":编号,"patch":{重新估算后的字段}}],"reply":"说明改成了多少"}。只要用户在订正已记录内容的【量 / 重量口径(生重熟重) / 做法 / 用料】，就必须 edit：自己重新把该条目的数值算好放进 patch（kcal/protein/carbs/fat/fiber/gi 等），不要只用 discuss 解释。\n` +
-      `3) 提问/讨论/请教（如"晚上吃寿喜烧行吗""选什么牛肉片更减脂"，常是对前面话题的追问）→ {"action":"discuss","reply":"详细解答"}\n\n` +
+      `1) 记录新的食物或运动 → {"action":"add","targetDate":"YYYY-MM-DD","foods":[...],"exercises":[...],"reply":"简短反馈"}\n` +
+      `2) 纠正已有条目 → {"action":"edit","targetDate":"YYYY-MM-DD","edits":[{"id":编号,"patch":{...}}],"reply":"..."}\n` +
+      `3) 提问/讨论 → {"action":"discuss","reply":"详细解答"}\n` +
+      `4) 删除/清空记录（用户说记错了、删掉、清空某天）→ {"action":"clear","clearDates":["YYYY-MM-DD",...],"reply":"说明删了哪些天"}\n\n` +
       `判断要点：用户在【陈述自己刚吃了/做了什么/练了什么】→ 必须 add，并填好 foods 和/或 exercises；一句话里同时有运动+饮食时，两个数组都要填，不能留空。用户句子里已写明的 kcal（如 300kcal、60kcal）必须原样采用。` +
       `只有带问号、在征求建议、在延续上文纯讨论时，才用 discuss。` +
       `绝不能 action:add 但 foods 和 exercises 都为空；绝不能只 reply「好的」却不给条目。` +
@@ -1432,11 +1478,10 @@ export default function App() {
     return { parsed, list };
   }
 
-  // 把一条消息追加进某天的 chat（分天隔离、可持久化）
-  const withChat = (d, key, msg) => {
-    const base = d.days[key] || recompute({ entries: [] });
-    const day = { ...base, chat: [...(base.chat || []), msg] };
-    return { ...d, days: { ...d.days, [key]: day } };
+  // 全局管家对话（不分天）；饮食 entries 仍按天存
+  const withChat = (d, msg) => {
+    const chat = [...(d.assistantChat || []), msg];
+    return { ...d, assistantChat: chat };
   };
 
   async function addImages(fileList) {
@@ -1489,6 +1534,9 @@ export default function App() {
       {m.images && m.images.length > 0 && (
         <div style={S.visionTag}>{m.vision ? "📷 已识别照片" : "📷 照片未识别"}</div>
       )}
+      {m.logDay && m.logDay !== TODAY && (
+        <div style={S.logDayTag}>记到 {dayLabelFromKey(m.logDay)}</div>
+      )}
       {m.text}
     </div>
   );
@@ -1497,9 +1545,8 @@ export default function App() {
     const displayText = input.trim();
     const images = pendingImages;
     if ((!displayText && !images.length) || loading) return;
-    const dayKey = normalizeDayKey(forDayKey || inferBackfillDay(displayText, asstDate));
-    if (dayKey !== asstDate) setAsstDate(dayKey);
-    const history = ((data.days[dayKey] && data.days[dayKey].chat) || []).slice(-6);
+    const dayKey = normalizeDayKey(forDayKey || inferBackfillDay(displayText, TODAY));
+    const history = assistantChat.slice(-12);
     setInput("");
     setPendingImages([]);
     setLoading(true);
@@ -1520,19 +1567,21 @@ export default function App() {
         ].filter(Boolean).join("\n\n");
       }
     }
-    const meMsg = { who: "me", text: displayText, images: images.map((im) => im.dataUrl) };
+    const meMsg = { who: "me", text: displayText, logDay: dayKey, images: images.map((im) => im.dataUrl) };
     if (visionDesc) meMsg.vision = visionDesc;
-    const afterUser = withChat(data, dayKey, meMsg);
+    const afterUser = withChat(data, meMsg);
     await persist(afterUser);
     const numFields = (patch, keys) => {
       const o = {};
       keys.forEach((k) => { if (patch[k] != null && !isNaN(+patch[k])) o[k] = +patch[k]; });
       return o;
     };
-    const dateTag = dayKey === TODAY ? "今日" : dayLabel(dayKey);
+    let recordDay = dayKey;
+    const dateTagFor = (dk) => dk === TODAY ? "今日" : dayLabel(dk);
 
-    const commitAdd = async (base, foods, exercises, reply) => {
-      const isToday = dayKey === TODAY;
+    const commitAdd = async (base, foods, exercises, reply, targetDay = recordDay) => {
+      const dk = normalizeDayKey(targetDay);
+      const isToday = dk === TODAY;
       const now = new Date();
       const hhmm = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
       let ff = applyTimesFromText(foods.map(normFood), text, true);
@@ -1540,25 +1589,25 @@ export default function App() {
       ff.forEach((f) => { if (!f.time) f.time = isToday ? hhmm : "12:00"; });
       ee.forEach((x) => { if (!x.time) x.time = isToday ? hhmm : "17:00"; });
       const dnext = { ...base, days: { ...base.days } };
-      const day = { ...dnext.days[dayKey], entries: [...(dnext.days[dayKey].entries || [])] };
-      const entryTs = isToday ? Date.now() : Date.parse(`${dayKey}T12:00:00`) + day.entries.length * 60000;
+      const prev = dnext.days[dk] || recompute({ entries: [] });
+      const day = { ...prev, entries: [...(prev.entries || [])] };
+      const entryTs = isToday ? Date.now() : Date.parse(`${dk}T12:00:00`) + day.entries.length * 60000;
       day.entries.push({ ts: entryTs, text, foods: ff, exercises: ee });
-      dnext.days[dayKey] = recompute(day);
-      const def = deficitOf(dnext.days[dayKey], dnext.profile.baseline);
+      dnext.days[dk] = recompute(day);
+      const def = deficitOf(dnext.days[dk], dnext.profile.baseline);
       const detail = [
         ff.length ? `+${ff.reduce((s, f) => s + num(f.kcal), 0)} kcal` : "",
         ee.length ? `运动 −${ee.reduce((s, x) => s + num(x.burn), 0)} kcal` : "",
       ].filter(Boolean).join("，");
-      // 去掉 AI 自己回复里已带的 (+N kcal) / (运动 −N kcal)，避免重复显示
       const cleanReply = String(reply).replace(/[（(][+\-−]?\s*\d+\s*kcal[^）)]*[）)]/gi, "").replace(/[（(]\s*运动[^）)]*kcal[^）)]*[）)]/gi, "").trim();
-      await persist(withChat(dnext, dayKey, { who: "ai", kind: "log", text: `${cleanReply}${detail ? `（${detail}）` : ""}`, note: `${dateTag}缺口 ${def} kcal` }));
-      setPicked(dayKey);
+      const tag = dateTagFor(dk);
+      await persist(withChat(dnext, { who: "ai", kind: "log", text: `${cleanReply}${detail ? `（${detail}）` : ""}`, note: `${tag}缺口 ${def} kcal`, logDay: dk }));
+      setPicked(dk);
     };
 
     try {
-      // 识图彻底失败且没有文字可处理：明确告知，不要假装记录
       if (visionErr && !displayText) {
-        await persist(withChat(afterUser, dayKey, { who: "ai", kind: "chat", text: `📷 没能读取这张照片：${formatAIError(visionErr)}\n可以再发一次，或直接用文字描述一下。` }));
+        await persist(withChat(afterUser, { who: "ai", kind: "chat", text: `📷 没能读取这张照片：${formatAIError(visionErr)}\n可以再发一次，或直接用文字描述一下。` }));
         return;
       }
       let parsed, list;
@@ -1569,8 +1618,8 @@ export default function App() {
         parsed = { action: "add", reply: "" };
         list = [];
       }
+      if (parsed.targetDate && isValidDayKey(parsed.targetDate)) recordDay = parsed.targetDate;
       let reply = stripMd(parsed.reply) || "好的";
-      // 有图但识别失败、却仍有文字时：明确提示已降级为纯文字估算
       if (visionErr && displayText) reply = `（这张照片没读取成功，已仅按你的文字估算）\n\n${reply}`;
       let foods = Array.isArray(parsed.foods) ? parsed.foods : [];
       let exercises = Array.isArray(parsed.exercises) ? parsed.exercises : [];
@@ -1578,7 +1627,6 @@ export default function App() {
       let action = parsed.action;
       if (!action) action = edits.length ? "edit" : (foods.length || exercises.length) ? "add" : "discuss";
 
-      // AI 误判 discuss / 空 add / 只回「好的」→ 用专用估算引擎兜底写入
       const shouldFallback =
         looksLikeLog(text) &&
         !edits.length &&
@@ -1605,11 +1653,22 @@ export default function App() {
         }
       }
 
-      if (action === "discuss") {
-        await persist(withChat(afterUser, dayKey, { who: "ai", kind: "chat", text: reply }));
+      if (action === "clear") {
+        const rawDates = parsed.clearDates || parsed.clearDays || [recordDay];
+        const dates = rawDates.map((d) => normalizeDayKey(d)).filter(isValidDayKey);
+        let dnext = { ...afterUser, days: { ...afterUser.days } };
+        dates.forEach((k) => {
+          if (dnext.days[k]) dnext.days[k] = recompute({ ...dnext.days[k], entries: [] });
+        });
+        await persist(withChat(dnext, { who: "ai", kind: "log", text: reply, logDay: dates[0] }));
+        if (dates[0]) setPicked(dates[0]);
+      } else if (action === "discuss") {
+        await persist(withChat(afterUser, { who: "ai", kind: "chat", text: reply }));
       } else if (action === "edit" && edits.length) {
+        const dk = recordDay;
         const dnext = { ...afterUser, days: { ...afterUser.days } };
-        const entries = dnext.days[dayKey].entries.map((e) => ({ ...e, foods: [...(e.foods || [])], exercises: [...(e.exercises || [])] }));
+        const prev = dnext.days[dk] || recompute({ entries: [] });
+        const entries = (prev.entries || []).map((e) => ({ ...e, foods: [...(e.foods || [])], exercises: [...(e.exercises || [])] }));
         edits.forEach((ed) => {
           const tgt = list[ed.id];
           if (!tgt || !ed.patch) return;
@@ -1622,16 +1681,16 @@ export default function App() {
             ? { ...cur, ...numFields(ed.patch, ["kcal", "protein", "carbs", "fat", "fiber", "gi"]), ...(ed.patch.name ? { name: ed.patch.name } : {}), ...(ed.patch.nutrients != null ? { nutrients: ed.patch.nutrients } : {}), ...(ed.patch.time ? { time: ed.patch.time } : {}) }
             : { ...cur, ...numFields(ed.patch, ["burn"]), ...(ed.patch.name ? { name: ed.patch.name } : {}), ...(ed.patch.kind ? { kind: ed.patch.kind } : {}), ...(ed.patch.time ? { time: ed.patch.time } : {}) };
         });
-        dnext.days[dayKey] = recompute({ ...dnext.days[dayKey], entries });
-        const def = deficitOf(dnext.days[dayKey], dnext.profile.baseline);
-        await persist(withChat(dnext, dayKey, { who: "ai", kind: "log", text: reply, note: `${dateTag}缺口 ${def} kcal` }));
-        setPicked(dayKey);
+        dnext.days[dk] = recompute({ ...prev, entries });
+        const def = deficitOf(dnext.days[dk], dnext.profile.baseline);
+        await persist(withChat(dnext, { who: "ai", kind: "log", text: reply, note: `${dateTagFor(dk)}缺口 ${def} kcal`, logDay: dk }));
+        setPicked(dk);
       } else if (foods.length || exercises.length) {
         await commitAdd(afterUser, foods, exercises, reply);
       } else if (looksLikeLog(text)) {
-        await persist(withChat(afterUser, dayKey, { who: "ai", kind: "chat", text: "看起来像是在记饮食/运动，但我没解析成功。请再发一次，或把运动和饮食分两条发。" }));
+        await persist(withChat(afterUser, { who: "ai", kind: "chat", text: "看起来像是在记饮食/运动，但我没解析成功。请再发一次，或把运动和饮食分两条发。" }));
       } else {
-        await persist(withChat(afterUser, dayKey, { who: "ai", kind: "chat", text: reply }));
+        await persist(withChat(afterUser, { who: "ai", kind: "chat", text: reply }));
       }
     } catch (e) {
       const local = looksLikeLog(text) ? parseLogLocally(text) : null;
@@ -1643,7 +1702,7 @@ export default function App() {
       }
       setInput(displayText);
       if (images.length) setPendingImages(images);
-      await persist(withChat(afterUser, dayKey, { who: "ai", kind: "chat", text: formatAIError(e) }));
+      await persist(withChat(afterUser, { who: "ai", kind: "chat", text: formatAIError(e) }));
     } finally {
       setLoading(false);
     }
@@ -1751,13 +1810,10 @@ export default function App() {
   const today = data.days[TODAY];
   const todayDef = deficitOf(today, data.profile.baseline);
   const dayLabel = dayLabelFromKey;
-  const safeAsstDate = normalizeDayKey(asstDate);
-  const openAsst = (date) => {
-    if (date) setAsstDate(date);
-    else if (!isValidDayKey(asstDate)) setAsstDate(TODAY);
-    setAsstFull(true);
-    setAsstOpen(true);
-  };
+  const closeAsst = () => { setAsstOpen(false); setAsstFull(false); };
+  const openAsst = () => { setAsstFull(true); setAsstOpen(true); };
+  const switchTab = (k) => { closeAsst(); setTab(k); };
+  const recentChat = assistantChat.slice(-10);
   const dailyTarget = data.goal && data.goal.durationDays
     ? Math.round((data.goal.targetKg * KCAL_PER_KG) / data.goal.durationDays)
     : 300;
@@ -1790,15 +1846,15 @@ export default function App() {
             <div style={S.todayChatHead}>
               <Mascot size={28} />
               <span style={S.todayChatName}>营养健身管家</span>
-              <button style={S.asstIconBtn} onClick={() => openAsst(TODAY)} aria-label="全屏">⤢</button>
+              <button style={S.asstIconBtn} onClick={() => openAsst()} aria-label="全屏">⤢</button>
             </div>
             <div ref={chatRef} style={S.todayChatBody}>
-              {(today?.chat || []).length === 0 && (
+              {recentChat.length === 0 && (
                 <div style={S.hint}>
                   随时跟我说，比如「午饭吃了…」「跑步机30分钟」，<br />也可以问任何饮食健身的问题。
                 </div>
               )}
-              {(today?.chat || []).map((m, i) => (
+              {recentChat.map((m, i) => (
                 <div key={i} style={{ ...S.bubbleRow, justifyContent: m.who === "me" ? "flex-end" : "flex-start" }}>
                   {m.who === "me" ? (
                     meBubble(m)
@@ -1823,13 +1879,12 @@ export default function App() {
               <input
                 className="field"
                 style={S.input}
-                value={!asstOpen || asstDate === TODAY ? input : ""}
-                placeholder="和管家说点什么…"
-                onFocus={() => { if (asstDate !== TODAY) setAsstDate(TODAY); }}
-                onChange={(e) => { if (asstDate !== TODAY) setAsstDate(TODAY); setInput(e.target.value); }}
-                onKeyDown={(e) => { if (e.key === "Enter" && !e.nativeEvent.isComposing && e.keyCode !== 229) handleSend(TODAY); }}
+                value={input}
+                placeholder="和管家说点什么…（说周几会自动记到那天）"
+                onChange={(e) => setInput(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter" && !e.nativeEvent.isComposing && e.keyCode !== 229) handleSend(); }}
               />
-              <button className="send" style={S.send} onClick={() => handleSend(TODAY)} disabled={loading}>发送</button>
+              <button className="send" style={S.send} onClick={() => handleSend()} disabled={loading}>发送</button>
             </div>
           </div>
 
@@ -1927,8 +1982,7 @@ export default function App() {
             const { data: fresh } = hydrateData(authMode ? blankData() : seedData(), { seed: !authMode });
             await persist(fresh);
             setPicked(TODAY);
-            setAsstDate(TODAY);
-            setAsstOpen(false);
+            closeAsst();
           }}
         />
       )}
@@ -1939,7 +1993,7 @@ export default function App() {
       {asstOpen && (
         <div
           style={asstFull ? S.asstFullBackdrop : S.asstBackdrop}
-          onClick={(e) => { if (e.target === e.currentTarget) setAsstOpen(false); }}
+          onClick={(e) => { if (e.target === e.currentTarget && !asstFull) closeAsst(); }}
         >
           <div style={asstFull ? S.asstPanelFull : S.asstPanel}>
             <div style={S.asstHead}>
@@ -1947,38 +2001,25 @@ export default function App() {
               <div style={S.asstHeadText}>
                 <div style={S.asstName}>营养健身管家</div>
                 <div style={S.asstDateLine}>
-                  <input
-                    type="date"
-                    className="field"
-                    style={S.asstDateInput}
-                    max={TODAY}
-                    value={safeAsstDate}
-                    onChange={(e) => {
-                      const v = e.target.value;
-                      if (v) setAsstDate(v);
-                      else setAsstDate(TODAY);
-                    }}
-                  />
-                  {safeAsstDate !== TODAY && (
-                    <button className="link" style={S.asstToday} onClick={() => setAsstDate(TODAY)}>回今天</button>
-                  )}
+                  <span style={S.asstTodayLabel}>今天 {dayLabel(TODAY)} · 同一管家持续对话</span>
                 </div>
               </div>
+              {asstFull && (
+                <button className="link" style={S.asstBackBtn} onClick={closeAsst}>返回</button>
+              )}
               <button style={S.asstIconBtn} onClick={() => setAsstFull(!asstFull)} aria-label="放大">
                 {asstFull ? "⤡" : "⤢"}
               </button>
-              <button style={S.asstIconBtn} onClick={() => setAsstOpen(false)} aria-label="关闭">✕</button>
+              <button style={S.asstIconBtn} onClick={closeAsst} aria-label="关闭">✕</button>
             </div>
 
             <div ref={chatRef} style={asstFull ? S.asstBodyFull : S.asstBody}>
               {asstChat.length === 0 && (
                 <div style={S.hint}>
-                  {safeAsstDate !== TODAY && (<><b style={{ color: C.accentDark }}>正在聊 {dayLabel(safeAsstDate)}</b><br /></>)}
                   我是你的营养健身管家，随时跟我说：<br />
-                  「午饭吃了1.5拳牛腩、海带沙拉、5口米饭」<br />
-                  「跑步机爬坡30分钟＋楼梯机12分钟」<br />
-                  也可以问我「晚上吃寿喜烧行吗」之类的任何问题。<br />
-                  你的记录我会<b>按天分别保存</b>。
+                  「周五早上吃了可颂…」「周六午饭吃了 poke bowl…」<br />
+                  说了周几会自动记到对应那天；也可以问任何问题。<br />
+                  饮食按天归类，但对话是连续的，不用每天重新介绍自己。
                 </div>
               )}
               {asstChat.map((m, i) => (
@@ -2008,7 +2049,7 @@ export default function App() {
                 className="field"
                 style={S.input}
                 value={input}
-                placeholder={safeAsstDate === TODAY ? "和管家说点什么…" : `聊/补记 ${dayLabel(safeAsstDate)}…`}
+                placeholder="和管家说点什么…（说「周六早上」会记到周六）"
                 onChange={(e) => setInput(e.target.value)}
                 onKeyDown={(e) => { if (e.key === "Enter" && !e.nativeEvent.isComposing && e.keyCode !== 229) handleSend(); }}
               />
@@ -2018,7 +2059,7 @@ export default function App() {
         </div>
       )}
 
-      <BottomNav tab={tab} setTab={setTab} onChat={() => openAsst()} chatActive={asstOpen} />
+      <BottomNav tab={tab} setTab={switchTab} onChat={() => openAsst()} chatActive={asstOpen} />
     </div>
   );
 }
@@ -3511,7 +3552,7 @@ const S = {
   goalMeta: { display: "flex", justifyContent: "space-between", fontSize: 12, color: C.muted, marginTop: 10 },
   goalToday: { fontSize: 12.5, marginTop: 14, paddingTop: 14, borderTop: `1px solid ${C.line}`, fontWeight: 500 },
   goalPace: { fontSize: 12.5, marginTop: 8, fontWeight: 500, lineHeight: 1.5 },
-  bottomNav: { position: "fixed", left: 0, right: 0, bottom: 0, zIndex: 50, display: "flex", justifyContent: "center", padding: "0 14px calc(env(safe-area-inset-bottom) + 14px)", pointerEvents: "none" },
+  bottomNav: { position: "fixed", left: 0, right: 0, bottom: 0, zIndex: 80, display: "flex", justifyContent: "center", padding: "0 14px calc(env(safe-area-inset-bottom) + 14px)", pointerEvents: "none" },
   bottomInner: { pointerEvents: "auto", width: "100%", maxWidth: 420, display: "flex", padding: "8px 8px", background: C.card, border: `1px solid ${C.cardBorder}`, borderRadius: 24, boxShadow: "0 6px 26px rgba(28,43,36,.10)" },
   navBtn: { flex: 1, display: "flex", flexDirection: "column", alignItems: "center", gap: 4, border: "none", background: "transparent", cursor: "pointer", padding: "2px 0" },
   navIconWrap: { width: 40, height: 30, borderRadius: 999, display: "flex", alignItems: "center", justifyContent: "center", transition: "background .2s" },
@@ -3555,6 +3596,7 @@ const S = {
   msgImgRow: { display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 6 },
   msgImg: { width: 96, height: 96, objectFit: "cover", borderRadius: 10, display: "block" },
   visionTag: { fontSize: 11, opacity: 0.85, marginBottom: 4 },
+  logDayTag: { fontSize: 11, opacity: 0.75, marginBottom: 4 },
   thumbStrip: { display: "flex", gap: 8, padding: "8px 12px 0", flexWrap: "wrap" },
   thumbWrap: { position: "relative", width: 56, height: 56 },
   thumbImg: { width: 56, height: 56, objectFit: "cover", borderRadius: 10, border: `1px solid ${C.line}`, display: "block" },
@@ -3594,6 +3636,8 @@ const S = {
   asstDateLine: { display: "flex", alignItems: "center", gap: 8, marginTop: 2 },
   asstDateInput: { border: "none", background: "transparent", color: C.muted, fontSize: 12, padding: 0, outline: "none" },
   asstToday: { fontSize: 12, color: C.accentDark, background: "none", border: "none", cursor: "pointer", padding: 0 },
+  asstTodayLabel: { fontSize: 12, color: C.muted },
+  asstBackBtn: { fontSize: 14, color: C.accentDark, padding: "6px 10px", background: C.accentSoft, border: "none", borderRadius: 10, cursor: "pointer", fontWeight: 600 },
   asstIconBtn: { width: 32, height: 32, borderRadius: 10, border: "none", background: C.soft, color: C.muted, fontSize: 15, cursor: "pointer", flexShrink: 0 },
   asstBody: { flex: 1, overflowY: "auto", display: "flex", flexDirection: "column", gap: 10, padding: "14px 14px" },
   asstBodyFull: { flex: 1, overflowY: "auto", display: "flex", flexDirection: "column", gap: 10, padding: "16px 16px", maxWidth: 520, width: "100%", margin: "0 auto", boxSizing: "border-box" },
