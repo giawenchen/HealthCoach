@@ -449,6 +449,27 @@ function scrubAllDays(data) {
   return { ...data, days };
 }
 
+// 加载时把只有 kcal、宏观营养为 0 的旧记录即时补全
+function migrateNutritionSync(data) {
+  const days = { ...data.days };
+  let changed = false;
+  Object.keys(days).forEach((k) => {
+    const entries = (days[k].entries || []).map((e) => ({
+      ...e,
+      foods: (e.foods || []).map((f) => {
+        const nf = normFood(f);
+        return foodNeedsNutrition(nf) ? estimateMacrosFromKcal(nf) : nf;
+      }),
+    }));
+    const next = recompute({ ...days[k], entries });
+    if (JSON.stringify(next) !== JSON.stringify(days[k])) {
+      days[k] = next;
+      changed = true;
+    }
+  });
+  return changed ? { ...data, days } : data;
+}
+
 // 合并各天旧 chat 到全局管家对话
 function migrateAssistantChat(data) {
   if (Array.isArray(data.assistantChat)) return data;
@@ -473,6 +494,84 @@ function looksLikeLog(text) {
   if (!text) return false;
   if (/[？?]|吗[。！]?$|行不行|可不可以|能不能|建议|应该吃/.test(text)) return false;
   return /(?:吃了|喝了|跑了|练了|做了|训练|运动|有氧|跑步|爬坡|早餐|早上|午饭|晚饭|加餐|\d+\s*kcal|\d+\s*大卡|\d+\s*卡\b|一个.*蛋|水煮蛋)/i.test(text);
+}
+
+function looksLikeNutritionComplaint(text) {
+  if (!text) return false;
+  return /为什么|咋|怎么|为何/.test(text) && /营养|蛋白|碳水|脂肪|纤维|没记|没记录|没写上|漏|含量/.test(text)
+    || /营养含量|没记上营养|补充.*营养|没有记录营养|为什么没有记录/.test(text);
+}
+
+function looksLikeCorrection(text) {
+  if (!text) return false;
+  return /算错|估多|估少|不对|多了|少了|应该是|其实|去皮|没这么高|哪来|只有\d+g|大概|小拇指|巴掌|厚度/.test(text);
+}
+
+function foodNeedsNutrition(f) {
+  const kcal = num(f.kcal);
+  if (kcal <= 15) return false;
+  if (num(f.protein) === 0 && num(f.carbs) === 0 && num(f.fat) === 0) return true;
+  const macroKcal = num(f.protein) * 4 + num(f.carbs) * 4 + num(f.fat) * 9;
+  return macroKcal < kcal * 0.25;
+}
+
+// AI 没给宏观营养时的本地兜底（按食物类型粗分蛋白/碳水/脂肪）
+function estimateMacrosFromKcal(f) {
+  const kcal = num(f.kcal);
+  if (kcal <= 0 || !foodNeedsNutrition(f)) return normFood(f);
+  const name = String(f.name || "");
+  const n = name.toLowerCase();
+  let protein = 0, carbs = 0, fat = 0, fiber = num(f.fiber);
+  if (/鸡胸|鸡肉|鸡块|chicken|turkey|火鸡|牛肉|牛排|steak|鱼|虾|蟹|刺身|sashimi|tuna|salmon|蛋白|盐焗|焗鸡|pesto.*鸡|沙拉鸡/.test(name)) {
+    protein = Math.round(kcal * 0.52 / 4);
+    fat = Math.max(1, Math.round(kcal * 0.18 / 9));
+    carbs = Math.max(0, Math.round((kcal - protein * 4 - fat * 9) / 4));
+  } else if (/圣女果|番茄|tomato|蔬菜|西兰花|黄瓜|沙拉(?!.*鸡块)|水果|瓜|莓/.test(name)) {
+    protein = Math.max(0, Math.round(kcal * 0.08 / 4));
+    carbs = Math.round(kcal * 0.75 / 4);
+    fat = 0;
+    fiber = fiber || Math.max(1, Math.round(carbs * 0.2));
+  } else if (/米饭|饭|面|粉|面包|可颂|bagel|贝果|碳水|炒饭|土豆/.test(name)) {
+    carbs = Math.round(kcal * 0.82 / 4);
+    protein = Math.max(1, Math.round(kcal * 0.1 / 4));
+    fat = Math.max(0, Math.round((kcal - protein * 4 - carbs * 4) / 9));
+  } else if (/蛋糕|甜点|巧克力|糖|toffee|奶油|pest|酱|油/.test(name)) {
+    fat = Math.round(kcal * 0.45 / 9);
+    carbs = Math.round(kcal * 0.4 / 4);
+    protein = Math.max(1, Math.round(kcal * 0.1 / 4));
+  } else {
+    protein = Math.round(kcal * 0.25 / 4);
+    fat = Math.round(kcal * 0.3 / 9);
+    carbs = Math.max(0, Math.round((kcal - protein * 4 - fat * 9) / 4));
+  }
+  return normFood({ ...f, protein, carbs, fat, fiber: fiber || Math.max(0, Math.round(carbs * 0.08)) });
+}
+
+function mergeEnrichedFood(base, from) {
+  const fb = normFood(from);
+  return normFood({
+    ...base,
+    protein: num(fb.protein) > 0 ? fb.protein : base.protein,
+    carbs: num(fb.carbs) > 0 ? fb.carbs : base.carbs,
+    fat: num(fb.fat) > 0 ? fb.fat : base.fat,
+    fiber: num(fb.fiber) > 0 ? fb.fiber : base.fiber,
+    nutrients: fb.nutrients || base.nutrients,
+    kcal: num(base.kcal) || num(fb.kcal),
+  });
+}
+
+function finalizeFoodList(foods) {
+  return (foods || []).map((f) => {
+    const nf = normFood(f);
+    return foodNeedsNutrition(nf) ? estimateMacrosFromKcal(nf) : nf;
+  });
+}
+
+function matchFoodName(a, b) {
+  const x = String(a || "").replace(/\s/g, "");
+  const y = String(b || "").replace(/\s/g, "");
+  if (!x || !y) return false;
+  return x.includes(y) || y.includes(x) || x.slice(0, 4) === y.slice(0, 4);
 }
 
 // 从「早上8点半」这类话提取 HH:MM
@@ -845,8 +944,10 @@ function hydrateData(raw, opts = {}) {
     Object.keys(base.days).forEach((k) => { base.days[k] = recompute(base.days[k]); });
     const migrated = migrateAssistantChat(base);
     const scrubbed = scrubAllDays(migrated);
+    const withNutrition = migrateNutritionSync(scrubbed);
     const scrubChanged = JSON.stringify(scrubbed.days) !== JSON.stringify(migrated.days);
-    return { data: scrubbed, changed: (raw.version || 0) < DATA_VERSION || migrated.assistantChat !== base.assistantChat || scrubChanged };
+    const nutChanged = JSON.stringify(withNutrition.days) !== JSON.stringify(scrubbed.days);
+    return { data: withNutrition, changed: (raw.version || 0) < DATA_VERSION || migrated.assistantChat !== base.assistantChat || scrubChanged || nutChanged };
   }
   const periods = (raw.periods && raw.periods.length) ? raw.periods : ["2026-06-06"];
   const goal = raw.goal || { targetKg: 4, durationDays: 90, startDate: "2026-06-06" };
@@ -855,8 +956,10 @@ function hydrateData(raw, opts = {}) {
   Object.keys(next.days).forEach((k) => { next.days[k] = recompute(next.days[k]); });
   const migrated = migrateAssistantChat({ ...next, version: DATA_VERSION, assistantChat: next.assistantChat || [] });
   const scrubbed = scrubAllDays(migrated);
+  const withNutrition = migrateNutritionSync(scrubbed);
   const scrubChanged = JSON.stringify(scrubbed.days) !== JSON.stringify(migrated.days);
-  return { data: scrubbed, changed: changed || (raw.version || 0) < DATA_VERSION || migrated.assistantChat !== next.assistantChat || scrubChanged };
+  const nutChanged = JSON.stringify(withNutrition.days) !== JSON.stringify(scrubbed.days);
+  return { data: withNutrition, changed: changed || (raw.version || 0) < DATA_VERSION || migrated.assistantChat !== next.assistantChat || scrubChanged || nutChanged };
 }
 
 // 去掉 AI 回复里的 markdown 记号，聊天里只显示纯文本
@@ -1473,8 +1576,9 @@ export default function App() {
   }, [asstChat.length, loading, asstOpen, asstFull]);
 
   async function persist(next) {
-    setData(next);
-    try { await window.storage.set("coach-data", JSON.stringify(next)); } catch {}
+    const fixed = migrateNutritionSync(next);
+    setData(fixed);
+    try { await window.storage.set("coach-data", JSON.stringify(fixed)); } catch {}
   }
 
   // ── 调用 Claude 真·理解你的描述 ──────────────────
@@ -1483,15 +1587,49 @@ export default function App() {
     const sys =
       `你是一个营养与运动热量估算引擎。用户：${p.age}岁${p.sex}，身高${p.height}cm，体重${p.weight}kg。` +
       `根据用户用中文描述的当天饮食和/或运动，估算并只返回一个 JSON 对象，不要任何多余文字、不要 markdown 代码块、不要解释。` +
-      `格式：{"foods":[{"name":"中文名+大致份量","kcal":数字,"protein":克,"carbs":克,"fat":克,"fiber":克,"nutrients":"该食物突出的维生素/矿物质，用顿号分隔，如 维C、钾、铁；没有就空字符串"}],` +
+      `格式：{"foods":[{"name":"中文名+大致份量","kcal":数字,"protein":克,"carbs":克,"fat":克,"fiber":克,"nutrients":"维C、钾等，顿号分隔"}],` +
       `"exercises":[{"name":"中文名+时长","minutes":分钟,"burn":消耗kcal}],"reply":"一句简短中文教练反馈"}。` +
-      `规则：用拳头/口/个/碗等模糊量也要给出合理估值；膳食纤维也要估；nutrients 只填2-4个简短成分名（每个≤5字，顿号分隔，不要句子/“注意”/冒号/括号）；运动按体重${p.weight}kg和强度估算消耗；` +
+      `规则：每个 food 必须估算 protein/carbs/fat/fiber（克），有热量的食物禁止把蛋白碳水脂肪全填 0；用拳头/口/个/碗等模糊量也要给出合理估值；膳食纤维也要估；nutrients 只填2-4个简短成分名（每个≤5字，顿号分隔，不要句子/“注意”/冒号/括号）；运动按体重${p.weight}kg和强度估算消耗；` +
       `用户已在句子里给出具体 kcal（如 300kcal、60卡）时，必须原样采用该数字，不要改；` +
       `用户一次描述多个不同动作/运动时，exercises 必须拆成多条（每个动作单独一条，各自 name 和 burn），不要合并、不要加总成一个数；每条 burn 都必须 > 0；` +
       `没有食物则 foods 为 []，没有运动则 exercises 为 []。reply 控制在30字内、鼓励但具体。`;
 
     const res = await callLLM(`${sys}\n\n用户描述：${text}`, 2000);
     return parseAIJson(res);
+  }
+
+  // AI 只给了 kcal 没给宏观营养时，用营养引擎二次补全；仍缺则用本地公式兜底
+  async function enrichFoodsFromText(foods, sourceText) {
+    let result = finalizeFoodList(foods);
+    if (!result.some(foodNeedsNutrition)) return result;
+
+    try {
+      const fb = await parseWithAI(sourceText);
+      const fbFoods = (fb.foods || []).map(normFood);
+      result = result.map((f, i) => {
+        if (!foodNeedsNutrition(f)) return f;
+        let match = fbFoods[i];
+        if (!match || foodNeedsNutrition(match)) {
+          match = fbFoods.find((bf) => matchFoodName(f.name, bf.name));
+        }
+        if (match && (num(match.protein) > 0 || num(match.carbs) > 0 || num(match.fat) > 0)) {
+          return mergeEnrichedFood(f, match);
+        }
+        return f;
+      });
+    } catch { /* 走本地兜底 */ }
+
+    return result.map((f) => (foodNeedsNutrition(f) ? estimateMacrosFromKcal(f) : f));
+  }
+
+  async function enrichDayEntries(entries, fallbackText) {
+    const out = (entries || []).map((e) => ({ ...e, foods: [...(e.foods || [])] }));
+    for (const en of out) {
+      if (en.foods.some(foodNeedsNutrition)) {
+        en.foods = await enrichFoodsFromText(en.foods, en.text || fallbackText);
+      }
+    }
+    return out;
   }
 
   // 带上下文判断意图：新增 / 修改已有条目 / 只是讨论
@@ -1517,8 +1655,8 @@ export default function App() {
       `本条消息要记到哪一天（targetDate，YYYY-MM-DD）：看用户是否写了周几/昨天/几月几日；写了「周六早上」必须记到对应周六，不能和周五混在同一天；没写日期则默认今天 ${TODAY}。\n` +
       `当天（targetDate 那天）已记录的条目（JSON，含编号 id）：\n${JSON.stringify(itemsForAI)}\n` + convo + `\n` +
       `判断用户【最新这句话】的意图，只返回一个 JSON（不要多余文字、不要 markdown）：\n` +
-      `1) 记录新的食物或运动 → {"action":"add","targetDate":"YYYY-MM-DD","foods":[...],"exercises":[...],"reply":"简短反馈"}\n` +
-      `2) 纠正已有条目 → {"action":"edit","targetDate":"YYYY-MM-DD","edits":[{"id":编号,"patch":{...}}],"reply":"..."}\n` +
+      `1) 记录新的食物或运动 → {"action":"add","targetDate":"YYYY-MM-DD","foods":[{"name","kcal","protein","carbs","fat","fiber","nutrients"}],"exercises":[{"name","burn"}],"reply":"简短反馈"}。foods【每一项】必须同时给出 protein/carbs/fat/fiber 的克数估算，禁止只填 kcal 把宏观营养全留 0。\n` +
+      `2) 纠正已有条目 → {"action":"edit","targetDate":"YYYY-MM-DD","edits":[{"id":编号,"patch":{...}}],"reply":"..."}。改 kcal 时 patch 必须同时带上 protein/carbs/fat/fiber，不能只改热量。\n` +
       `3) 提问/讨论 → {"action":"discuss","reply":"详细解答"}\n` +
       `4) 删除/清空记录（用户说记错了、删掉、清空某天）→ {"action":"clear","clearDates":["YYYY-MM-DD",...],"reply":"说明删了哪些天"}。clear 会【整批移除条目】，绝不要把 kcal 改成 0 来假装删除。\n\n` +
       `判断要点：用户在【陈述自己刚吃了/做了什么/练了什么】→ 必须 add，并填好 foods 和/或 exercises；一句话里同时有运动+饮食时，两个数组都要填，不能留空。用户句子里已写明的 kcal（如 300kcal、60kcal）必须原样采用。` +
@@ -1640,6 +1778,9 @@ export default function App() {
     const afterUser = withChat(data, meMsg);
     await persist(afterUser);
 
+    let recordDay = dayKey;
+    const dateTagFor = (dk) => dk === TODAY ? "今日" : dayLabel(dk);
+
     // 用户要求删除：本地直接删条目，不让 AI 只把数字清零
     if (looksLikeClear(displayText)) {
       const dates = inferClearDates(displayText, afterUser, afterUser.assistantChat || []);
@@ -1654,20 +1795,40 @@ export default function App() {
       setLoading(false);
       return;
     }
+
+    if (looksLikeNutritionComplaint(displayText)) {
+      const dk = normalizeDayKey(dayKey);
+      const day = afterUser.days[dk];
+      if (day?.entries?.length) {
+        let dnext = { ...afterUser, days: { ...afterUser.days } };
+        const entries = await enrichDayEntries(dnext.days[dk].entries, displayText);
+        dnext.days[dk] = recompute({ ...dnext.days[dk], entries });
+        const def = deficitOf(dnext.days[dk], dnext.profile.baseline);
+        const stillMissing = entries.some((e) => (e.foods || []).some(foodNeedsNutrition));
+        const fixMsg = stillMissing
+          ? "已尝试补全营养数据，若仍有缺失请把食物名称和份量再发一次。"
+          : "已补上蛋白/碳水/脂肪/纤维等营养数据。";
+        await persist(withChat(dnext, { who: "ai", kind: "log", text: fixMsg, note: `${dateTagFor(dk)}缺口 ${def} kcal`, logDay: dk }));
+        setPicked(dk);
+        setLoading(false);
+        return;
+      }
+    }
+
     const numFields = (patch, keys) => {
       const o = {};
       keys.forEach((k) => { if (patch[k] != null && !isNaN(+patch[k])) o[k] = +patch[k]; });
       return o;
     };
-    let recordDay = dayKey;
-    const dateTagFor = (dk) => dk === TODAY ? "今日" : dayLabel(dk);
 
     const commitAdd = async (base, foods, exercises, reply, targetDay = recordDay) => {
       const dk = normalizeDayKey(targetDay);
       const isToday = dk === TODAY;
       const now = new Date();
       const hhmm = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
-      let ff = applyTimesFromText(foods.map(normFood), text, true);
+      let ff = finalizeFoodList(foods);
+      try { ff = await enrichFoodsFromText(ff, text); } catch { ff = finalizeFoodList(ff); }
+      ff = applyTimesFromText(ff, text, true);
       let ee = applyTimesFromText(exercises.map(normExercise), text, false);
       ff.forEach((f) => { if (!f.time) f.time = isToday ? hhmm : "12:00"; });
       ee.forEach((x) => { if (!x.time) x.time = isToday ? hhmm : "17:00"; });
@@ -1745,7 +1906,24 @@ export default function App() {
         await persist(withChat(dnext, { who: "ai", kind: "log", text: reply || `已删除 ${label} 的全部饮食与运动记录。`, logDay: merged[0] }));
         if (merged[0]) setPicked(merged[0]);
       } else if (action === "discuss") {
-        await persist(withChat(afterUser, { who: "ai", kind: "chat", text: reply }));
+        const dk = recordDay;
+        const day = afterUser.days[dk];
+        const needsNutrition = day?.entries?.some((e) => (e.foods || []).some(foodNeedsNutrition));
+        if (needsNutrition || looksLikeNutritionComplaint(displayText) || looksLikeCorrection(displayText)) {
+          let dnext = { ...afterUser, days: { ...afterUser.days } };
+          const entries = await enrichDayEntries(dnext.days[dk].entries, text);
+          dnext.days[dk] = recompute({ ...dnext.days[dk], entries });
+          const def = deficitOf(dnext.days[dk], dnext.profile.baseline);
+          await persist(withChat(dnext, {
+            who: "ai", kind: "log",
+            text: reply || "已自动补上蛋白/碳水/脂肪/纤维。",
+            note: `${dateTagFor(dk)}缺口 ${def} kcal`,
+            logDay: dk,
+          }));
+          setPicked(dk);
+        } else {
+          await persist(withChat(afterUser, { who: "ai", kind: "chat", text: reply }));
+        }
       } else if (action === "edit" && edits.length) {
         const dk = recordDay;
         const dnext = { ...afterUser, days: { ...afterUser.days } };
@@ -1759,10 +1937,26 @@ export default function App() {
           const arr = tgt.type === "food" ? en.foods : en.exercises;
           const cur = arr[tgt.i];
           if (!cur) return;
-          arr[tgt.i] = tgt.type === "food"
-            ? { ...cur, ...numFields(ed.patch, ["kcal", "protein", "carbs", "fat", "fiber", "gi"]), ...(ed.patch.name ? { name: ed.patch.name } : {}), ...(ed.patch.nutrients != null ? { nutrients: ed.patch.nutrients } : {}), ...(ed.patch.time ? { time: ed.patch.time } : {}) }
-            : { ...cur, ...numFields(ed.patch, ["burn"]), ...(ed.patch.name ? { name: ed.patch.name } : {}), ...(ed.patch.kind ? { kind: ed.patch.kind } : {}), ...(ed.patch.time ? { time: ed.patch.time } : {}) };
+          if (tgt.type === "food") {
+            let patched = normFood({
+              ...cur,
+              ...numFields(ed.patch, ["kcal", "protein", "carbs", "fat", "fiber", "gi"]),
+              ...(ed.patch.name ? { name: ed.patch.name } : {}),
+              ...(ed.patch.nutrients != null ? { nutrients: ed.patch.nutrients } : {}),
+              ...(ed.patch.time ? { time: ed.patch.time } : {}),
+            });
+            if (foodNeedsNutrition(patched)) patched = estimateMacrosFromKcal(patched);
+            arr[tgt.i] = patched;
+          } else {
+            arr[tgt.i] = { ...cur, ...numFields(ed.patch, ["burn"]), ...(ed.patch.name ? { name: ed.patch.name } : {}), ...(ed.patch.kind ? { kind: ed.patch.kind } : {}), ...(ed.patch.time ? { time: ed.patch.time } : {}) };
+          }
         });
+        for (const en of entries) {
+          en.foods = finalizeFoodList(en.foods);
+          if ((en.foods || []).some(foodNeedsNutrition)) {
+            try { en.foods = await enrichFoodsFromText(en.foods, en.text || text); } catch { en.foods = finalizeFoodList(en.foods); }
+          }
+        }
         dnext.days[dk] = scrubEmptyEntries({ ...prev, entries });
         const def = deficitOf(dnext.days[dk], dnext.profile.baseline);
         await persist(withChat(dnext, { who: "ai", kind: "log", text: reply, note: `${dateTagFor(dk)}缺口 ${def} kcal`, logDay: dk }));
@@ -2591,10 +2785,11 @@ function Entry({ e, onDelete, onItemDelete, onItemSave, reestimate }) {
 
 function EntryItem({ item, type, onDelete, onSave, reestimate }) {
   const [editing, setEditing] = useState(false);
-  const [f, setF] = useState(item);
+  const rawItem = type === "food" && foodNeedsNutrition(item) ? estimateMacrosFromKcal(item) : item;
+  const [f, setF] = useState(rawItem);
   const [busy, setBusy] = useState(false);
 
-  const open = () => { setF(item); setEditing(true); };
+  const open = () => { setF(rawItem); setEditing(true); };
   const num = (v) => (v === "" || v === null || isNaN(+v) ? 0 : +v);
   const save = () => {
     if (type === "food") {
@@ -2675,21 +2870,22 @@ function EntryItem({ item, type, onDelete, onSave, reestimate }) {
     );
   }
 
+  const displayItem = type === "food" && foodNeedsNutrition(item) ? estimateMacrosFromKcal(item) : item;
   const detail = type === "food"
     ? [
-        `${item.kcal} cal`,
-        `蛋白 ${item.protein}g`,
-        item.carbs ? `碳水 ${item.carbs}g` : null,
-        item.fat ? `脂肪 ${item.fat}g` : null,
-        item.fiber ? `纤维 ${item.fiber}g` : null,
-        item.gi != null && item.gi > 0 ? `升糖${glWord(foodGL(item))}` : null,
+        `${displayItem.kcal} cal`,
+        displayItem.protein > 0 ? `蛋白 ${displayItem.protein}g` : null,
+        displayItem.carbs > 0 ? `碳水 ${displayItem.carbs}g` : null,
+        displayItem.fat > 0 ? `脂肪 ${displayItem.fat}g` : null,
+        displayItem.fiber > 0 ? `纤维 ${displayItem.fiber}g` : null,
+        displayItem.gi != null && displayItem.gi > 0 ? `升糖${glWord(foodGL(displayItem))}` : null,
       ].filter(Boolean).join(" · ")
-    : `−${item.burn} cal`;
+    : `−${displayItem.burn} cal`;
 
   return (
     <div style={S.foodLine}>
       <div style={{ flex: 1, minWidth: 0 }}>
-        <div style={S.foodName}>{item.name}</div>
+        <div style={S.foodName}>{displayItem.name}</div>
         <div style={S.foodMacros}>{detail}</div>
       </div>
       <button className="link" style={S.itemEditBtn} onClick={open}>编辑</button>
