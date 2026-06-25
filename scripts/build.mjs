@@ -1,5 +1,5 @@
 import * as esbuild from "esbuild";
-import { mkdirSync, statSync } from "fs";
+import { mkdirSync, readFileSync, statSync, writeFileSync } from "fs";
 
 mkdirSync("public/dist", { recursive: true });
 
@@ -18,4 +18,15 @@ await esbuild.build({
 });
 
 const kb = statSync("public/dist/app.js").size / 1024;
-console.log(`✓ public/dist/app.js (${kb.toFixed(1)} KB minified)`);
+const buildId = Date.now().toString(36);
+writeFileSync("public/dist/build-id.txt", buildId);
+
+const htmlPath = "public/index.html";
+const html = readFileSync(htmlPath, "utf8");
+const patched = html.replace(
+  /src="\/dist\/app\.js[^"]*"/,
+  `src="/dist/app.js?v=${buildId}"`
+);
+writeFileSync(htmlPath, patched);
+
+console.log(`✓ public/dist/app.js (${kb.toFixed(1)} KB minified, v=${buildId})`);

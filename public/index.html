@@ -11,6 +11,7 @@
   <link rel="manifest" href="/manifest.webmanifest" />
   <link rel="icon" href="/icons/icon.svg" type="image/svg+xml" />
   <link rel="apple-touch-icon" href="/icons/icon.svg" />
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
   <title>食记 · 营养健身管家</title>
   <style>
     html, body, #root { margin: 0; min-height: 100%; background: #F4F9F6; }
@@ -68,7 +69,7 @@
   <div id="root"></div>
 
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
-  <script src="/dist/app.js" defer></script>
+  <script src="/dist/app.js?v=mqssuctx" defer></script>
   <script>
     const bootEl = document.getElementById("boot");
     const loginEl = document.getElementById("login");
@@ -191,14 +192,14 @@
           if (session && session.user && !window.__APP_STARTED) {
             window.__APP_STARTED = true;
             uid = session.user.id;
-            startApp().catch((e) => { bootEl.style.display = "flex"; bootEl.textContent = "加载失败：" + e.message; });
+            startApp().catch(onStartFail);
           }
         });
         const { data } = await sb.auth.getSession();
         if (data.session && data.session.user) {
           window.__APP_STARTED = true;
           uid = data.session.user.id;
-          await startApp();
+          await startApp().catch(onStartFail);
         } else {
           showLogin();
         }
@@ -206,6 +207,27 @@
         showLogin("初始化失败：" + (e.message || e), true);
       }
     })();
+
+    async function onStartFail(e) {
+      const msg = String(e && e.message || e);
+      if (/Babel/i.test(msg) && !sessionStorage.getItem("hc:babel-reset")) {
+        sessionStorage.setItem("hc:babel-reset", "1");
+        try {
+          if ("serviceWorker" in navigator) {
+            const regs = await navigator.serviceWorker.getRegistrations();
+            await Promise.all(regs.map((r) => r.unregister()));
+          }
+          if ("caches" in window) {
+            const keys = await caches.keys();
+            await Promise.all(keys.map((k) => caches.delete(k)));
+          }
+        } catch (_) {}
+        location.reload();
+        return;
+      }
+      bootEl.style.display = "flex";
+      bootEl.textContent = "加载失败：" + msg + "（可尝试清除浏览器缓存后刷新）";
+    }
 
     if ("serviceWorker" in navigator) {
       window.addEventListener("load", () => {
